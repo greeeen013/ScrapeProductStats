@@ -4,6 +4,7 @@ import csv
 import os
 import re
 from urllib.parse import urljoin
+import pandas as pd
 
 
 def smicro_scrape_product_page():
@@ -71,6 +72,63 @@ def smicro_scrape_product_page():
 
     print(f"Scrapování dokončeno. Data uložena v {csv_filename}")
 
+    # Konverze CSV do Excelu
+    convert_csv_to_excel(csv_filename)
+    print(f"Excel soubor byl vytvořen: {csv_filename.replace('.csv', '.xlsx')}")
+
+def convert_csv_to_excel(csv_filename):
+    """Konvertuje CSV soubor do Excel formátu (.xlsx) s formátováním cen jako Kč"""
+    excel_filename = csv_filename.replace('.csv', '.xlsx')
+
+    # Načtení CSV souboru
+    df = pd.read_csv(csv_filename, delimiter=';', encoding='utf-8')
+
+    # Přejmenování sloupců podle požadavků
+    df.columns = [
+        'index',
+        'název produktu',
+        'part number',
+        'Dostupnost u nás',
+        'Dostupnost u dodavatele',
+        'Cena bez DPH',
+        'Cena s DPH',
+        'Specifikace'
+    ]
+
+    # Uložení do Excelu s formátováním
+    with pd.ExcelWriter(excel_filename, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Produkty')
+
+        # Získání worksheetu
+        worksheet = writer.sheets['Produkty']
+
+        # Formátování sloupců s cenami jako české koruny
+        money_format = '#,##0" Kč"'
+
+        # Formát pro sloupec F (Cena bez DPH)
+        for cell in worksheet['F']:
+            cell.number_format = money_format
+
+        # Formát pro sloupec G (Cena s DPH)
+        for cell in worksheet['G']:
+            cell.number_format = money_format
+
+        # Automatické nastavení šířky sloupců podle obsahu
+        for column in worksheet.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+
+            # Přidání malé rezervy
+            adjusted_width = (max_length + 2) * 1.2
+            worksheet.column_dimensions[column_letter].width = adjusted_width
+
 def smicro_scrape_product_details(url):
     """Funkce pro scrapování detailů jednotlivého produktu"""
     response = requests.get(url)
@@ -99,13 +157,19 @@ def smicro_scrape_product_details(url):
                 if 'Part number' in header:
                     product_data['part_number'] = value
                 elif 'Dostupnost u nás' in header:
-                    # Odstranění nadbytečných mezer a nových řádků
-                    cleaned_value = ' '.join(value.split())
-                    product_data['availability_local'] = cleaned_value
+                    # Extrahujeme pouze informaci o počtu kusů (např. "Skladem 5 ks")
+                    stock_match = re.search(r'Skladem (\d+ ks)', value)
+                    if stock_match:
+                        product_data['availability_local'] = stock_match.group(0)
+                    else:
+                        product_data['availability_local'] = value.split('\n')[0].strip()
                 elif 'Dostupnost u dodavatele' in header:
-                    # Odstranění nadbytečných mezer a nových řádků
-                    cleaned_value = ' '.join(value.split())
-                    product_data['availability_supplier'] = cleaned_value
+                    # Extrahujeme pouze informaci o počtu kusů (např. "Skladem 5 ks")
+                    stock_match = re.search(r'Skladem (\d+ ks)', value)
+                    if stock_match:
+                        product_data['availability_supplier'] = stock_match.group(0)
+                    else:
+                        product_data['availability_supplier'] = value.split('\n')[0].strip()
 
     # Ceny
     price_div = soup.find('div', class_='detPrice')
@@ -114,7 +178,6 @@ def smicro_scrape_product_details(url):
         price_with_vat = price_div.find('div', class_='cenaDph')
 
         if price_without_vat:
-            # Extrahování číselné hodnoty ceny
             price_text = price_without_vat.text.replace('bez DPH', '').strip()
             numbers = re.findall(r'[\d\s]+', price_text)
             if numbers:
@@ -122,7 +185,6 @@ def smicro_scrape_product_details(url):
                 product_data['price_without_vat'] = clean_number
 
         if price_with_vat:
-            # Extrahování číselné hodnoty ceny
             price_text = price_with_vat.text.replace('s DPH', '').strip()
             numbers = re.findall(r'[\d\s]+', price_text)
             if numbers:
@@ -154,23 +216,19 @@ def init_csv_and_get_last_index(filename):
         'Cena bez DPH', 'Cena s DPH', 'Specifikace'
     ]
 
-    # Pokud soubor neexistuje, vytvořit ho s hlavičkou
     if not os.path.exists(filename):
         with open(filename, 'w', newline='', encoding='utf-8') as file:
             writer = csv.writer(file, delimiter=';')
             writer.writerow(headers)
         return 1
 
-    # Pokud soubor existuje, najít poslední použitý index
     with open(filename, 'r', newline='', encoding='utf-8') as file:
         reader = csv.reader(file, delimiter=';')
         rows = list(reader)
 
-        # Pokud je pouze hlavička, začít od 1
         if len(rows) <= 1:
             return 1
 
-        # Najít poslední řádek s daty
         last_row = rows[-1]
         try:
             last_index = int(last_row[0])
@@ -193,8 +251,8 @@ def save_to_csv(filename, index, product_data):
             product_data.get('specifications', '')
         ])
 
-# Ostatní funkce zůstávají stejné...
-# (smicro_scrape_product_details, save_to_csv zůstávají beze změn)
 
 if __name__ == "__main__":
-    smicro_scrape_product_page()
+    #smicro_scrape_product_page()
+    csv_filename = 'smicro_products.csv'
+    convert_csv_to_excel(csv_filename)
