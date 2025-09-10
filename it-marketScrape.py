@@ -354,6 +354,14 @@ def extract_variant_data(driver):
     dbg(f"→ {data.get('base_name','N/A')} | {data.get('variant_type','N/A')} | {data.get('price','N/A')} | {data.get('net_price','N/A')}")
     return data
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+def _resolve_excel_path(excel_file: str | Path) -> Path:
+    p = Path(excel_file)
+    if not p.is_absolute():
+        p = SCRIPT_DIR / p  # ukládej relativní cesty vedle skriptu
+    p.parent.mkdir(parents=True, exist_ok=True)  # jistota, že adresář existuje
+    return p
 
 def scrape_product_data(url, excel_file='product_data.xlsx', headless=True):
     # /de/ -> /en/
@@ -361,6 +369,8 @@ def scrape_product_data(url, excel_file='product_data.xlsx', headless=True):
     if '/de/' in parsed.path:
         parsed = parsed._replace(path=parsed.path.replace('/de/', '/en/'))
         url = urlunparse(parsed)
+
+    excel_path = _resolve_excel_path(excel_file)
 
     driver = chrome_driver(headless=headless)
     dbg(f"Otevírám URL: {url}")
@@ -374,7 +384,7 @@ def scrape_product_data(url, excel_file='product_data.xlsx', headless=True):
 
         # Excel
         try:
-            wb = openpyxl.load_workbook(excel_file)
+            wb = openpyxl.load_workbook(excel_path)
             sheet = wb.active
             dbg(f"Načítám existující Excel: {excel_file}")
         except FileNotFoundError:
@@ -443,8 +453,8 @@ def scrape_product_data(url, excel_file='product_data.xlsx', headless=True):
             ]
             sheet.append(row)
 
-        wb.save(excel_file)
-        dbg(f"Data uložena do {excel_file}")
+        wb.save(excel_path)
+        dbg(f"Data uložena do {excel_path}")
 
     finally:
         dbg("Ukončuji prohlížeč.")
