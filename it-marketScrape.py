@@ -1,5 +1,6 @@
 import re
 import time
+from pathlib import Path
 from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
 
 from selenium import webdriver
@@ -22,15 +23,105 @@ def dbg(msg):
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] {msg}")
 
+import re
+import time
+from pathlib import Path
+from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
 
-def chrome_driver(headless=True):
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import (
+    TimeoutException, NoSuchElementException, StaleElementReferenceException
+)
+
+import openpyxl
+from openpyxl import Workbook
+
+import requests
+from bs4 import BeautifulSoup
+
+from webdriver_manager.chrome import ChromeDriverManager  # Fixed missing import
+
+import platform
+import shutil
+from selenium.webdriver.chrome.service import Service as ChromeService
+
+# === Cross-platform Selenium config ===
+# Choose your browser without prompts:
+#   "chrome"   -> Google Chrome
+#   "chromium" -> Chromium (useful on Raspberry Pi OS / Debian)
+BROWSER_CHOICE = "chromium"  # change to "chrome" on Windows if you prefer
+
+# How to find chromedriver:
+#   "auto"   -> use webdriver-manager (great on Windows; downloads correct driver automatically)
+#   "system" -> use chromedriver from PATH or CHROMEDRIVER_PATH
+DRIVER_MODE = "auto" if platform.system() == "Windows" else "system"
+
+# Optional overrides (leave as None to auto-detect sensible defaults)
+CHROMIUM_BINARY = None  # e.g., "/usr/bin/chromium" or "/usr/bin/chromium-browser"
+CHROMEDRIVER_PATH = None  # e.g., "/usr/bin/chromedriver" on Raspberry Pi
+
+def chrome_driver(headless=True,
+                  browser_choice: str | None = None,
+                  driver_mode: str | None = None,
+                  chromium_binary: str | None = None,
+                  chromedriver_path: str | None = None):
+    """Create a Chrome/Chromium WebDriver that works on Windows and Raspberry Pi.
+
+    Parameters allow selecting Chrome vs Chromium and how to locate the driver.
+    They have sensible defaults from the module-level constants above.
+    """
+    bc = (browser_choice or BROWSER_CHOICE or "chromium").lower()
+    dm = (driver_mode or DRIVER_MODE or "system").lower()
+    binary_override = chromium_binary or CHROMIUM_BINARY
+    driver_override = chromedriver_path or CHROMEDRIVER_PATH
+
     opts = webdriver.ChromeOptions()
     if headless:
+        # \"new\" headless is correct for Chromium 109+
         opts.add_argument("--headless=new")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--window-size=1400,1600")
-    return webdriver.Chrome(options=opts)
+
+    # If user wants Chromium, set binary; try to autodetect common paths on Linux
+    if bc == "chromium":
+        if binary_override:
+            opts.binary_location = binary_override
+        else:
+            # try common Linux paths
+            for candidate in ("/usr/bin/chromium", "/usr/bin/chromium-browser"):
+                if Path(candidate).exists():
+                    opts.binary_location = candidate
+                    break
+
+    # Build the Service depending on mode
+    service = None
+    if dm == "auto":
+        try:
+            service = ChromeService(ChromeDriverManager().install())
+        except Exception as e:
+            # Fallback to system if webdriver-manager isn't available/working
+            dm = "system"
+
+    if dm == "system":
+        # Use explicit override, PATH, or common default on Linux
+        path = driver_override or shutil.which("chromedriver")
+        if not path and platform.system() != "Windows":
+            # Typical Raspberry Pi location
+            for candidate in ("/usr/bin/chromedriver", "/snap/bin/chromium.chromedriver"):
+                if Path(candidate).exists():
+                    path = candidate
+                    break
+        if not path:
+            raise RuntimeError("chromedriver was not found. Install it or set CHROMEDRIVER_PATH.")
+        service = ChromeService(executable_path=path)
+
+    return webdriver.Chrome(options=opts, service=service)
+
+# The rest of the code remains unchanged
 
 
 def safe_click_variant_by_index(driver, idx, timeout=15, max_retries=3):
@@ -531,13 +622,15 @@ def run_it_market_scraper(excel_file: str = "product_data.xlsx",
                 print(f"[{sec_name}] Na stránce {page_num} nejsou žádné produkty → končím sekci.")
                 break
 
-            for link in product_links:
+            for idx_on_page,link in enumerate(product_links, start=1):
                 url = _normalize_en_url(link)
                 if url in seen_urls:
                     continue
                 seen_urls.add(url)
 
-                print(f"  → produkt: {url}")
+                print(f"  → stránka: {page_num}")
+                print(f"  → produkt: {idx_on_page}/24")
+                print(f"  → url: {url}")
                 try:
                     # Volání existující funkce na detail (selenium), Excel appenduje sama
                     scrape_product_data(url, excel_file=excel_file, headless=headless)
