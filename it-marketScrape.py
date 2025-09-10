@@ -1,6 +1,6 @@
 import re
 import time
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -12,6 +12,10 @@ from selenium.common.exceptions import (
 
 import openpyxl
 from openpyxl import Workbook
+
+import requests
+from bs4 import BeautifulSoup
+
 
 
 def dbg(msg):
@@ -355,10 +359,206 @@ def scrape_product_data(url, excel_file='product_data.xlsx', headless=True):
         dbg("Ukončuji prohlížeč.")
         driver.quit()
 
+HOMEPAGE = "https://it-market.com/en"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/123.0.0.0 Safari/537.36"
+}
+
+def _soup_get(url: str, timeout: int = 20) -> BeautifulSoup:
+    """GET → BeautifulSoup s rozumnými hlavičkami a timeoutem."""
+    r = requests.get(url, headers=HEADERS, timeout=timeout)
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "html.parser")
+
+def _after_pipe_product_sections(homepage_url: str = HOMEPAGE):
+    """
+    Vrátí Ordered dict {název: url} pro položky za svislou čárou v hlavní navigaci.
+    Ignoruje Manufacturer / Services / Blog před '|'.
+    """
+    soup = _soup_get(homepage_url)
+    nav = soup.find("nav", id="main-navigation-menu")
+    if not nav:
+        raise RuntimeError("Nenalezena hlavní navigace (nav#main-navigation-menu).")
+
+    # Najdi '|' (span.main-navigation-spacer) a vezmi všechny následující <a.nav-link.main-navigation-link>
+    spacer = nav.find("span", class_="main-navigation-spacer")
+    if not spacer:
+        raise RuntimeError("Nenalezen oddělovač '|' v navigaci.")
+
+    sections = {}
+    for a in spacer.find_all_next("a", class_="main-navigation-link"):
+        txt = a.get_text(strip=True)
+        href = a.get("href")
+        if not href or not txt:
+            continue
+        # sekce jsou top-level kategorické odkazy (např. /en/switches, /en/router, …)
+        # pro jistotu filtruj na relativně krátké slugy (bez dalších podkategorií v URL)
+        try:
+            p = urlparse(href)
+            path_parts = [x for x in p.path.split("/") if x]
+            # očekáváme něco jako /en/switches nebo /en/router atd. → 2 nebo 3 části
+            # ['en','switches'] == 2 části
+            if len(path_parts) == 2 and path_parts[0] == "en":
+                sections[txt] = href
+        except Exception:
+            continue
+
+    if not sections:
+        raise RuntimeError("Za '|' nebyly nalezeny žádné produktové sekce.")
+
+    return sections
+
+def _iter_listing_pages(section_url: str, start_page: int = 1, max_pages: int | None = None):
+    """
+    Generátor vracející (page_number, soup) pro listing stránky sekce.
+    Končí, když:
+      - nenajde produktový wrapper, nebo
+      - se objeví chybová hláška 'Unfortunately, something went wrong.', nebo
+      - dojde na max_pages (pokud je nastaveno).
+    """
+    page = max(1, start_page)
+    while True:
+        # přidej / uprav ?p=N v URL
+        parsed = urlparse(section_url)
+        q = dict(parse_qsl(parsed.query))
+        q["p"] = str(page)
+        new_q = urlencode(q, doseq=True)
+        page_url = urlunparse(parsed._replace(query=new_q))
+
+        soup = _soup_get(page_url)
+
+        # chyba stránky (když přejedeme počet stránek)
+        err = soup.select_one("div.alert.alert-danger .alert-content")
+        if err and "Unfortunately, something went wrong" in err.get_text(strip=True):
+            break
+
+        wrapper = soup.find("div", class_="row cms-listing-row js-listing-wrapper", attrs={"role": "list"})
+        items = wrapper.find_all("div", class_="cms-listing-col") if wrapper else []
+        if not items:
+            # nic k zobrazení => konec
+            break
+
+        yield page, soup
+
+        page += 1
+        if max_pages is not None and page > max_pages:
+            break
+
+def _extract_product_links(listing_soup: BeautifulSoup) -> list[str]:
+    """
+    Z listingu vytáhne URL na detail produktu.
+    Hledá <a class="product-name stretched-link" href="...">, fallback na 'Details' tlačítko.
+    """
+    urls = []
+    wrapper = listing_soup.find("div", class_="row cms-listing-row js-listing-wrapper", attrs={"role": "list"})
+    if not wrapper:
+        return urls
+
+    cards = wrapper.find_all("div", class_="cms-listing-col", attrs={"role": "listitem"})
+    for card in cards:
+        a = card.select_one("a.product-name.stretched-link")
+        if not a:
+            a = card.select_one("a.btn.btn-primary.btn-detail")
+        if a and a.get("href"):
+            urls.append(a["href"])
+    return urls
+
+def _normalize_en_url(url: str) -> str:
+    """Jistota, že používáme /en/ (detaily mohou být /de/ → přepneme na /en/)."""
+    parsed = urlparse(url)
+    path = parsed.path.replace("/de/", "/en/")
+    return urlunparse(parsed._replace(path=path))
+
+def run_it_market_scraper(excel_file: str = "product_data.xlsx",
+                          headless: bool = True,
+                          delay_between_requests: float = 0.6,
+                          max_pages_per_section: int | None = None):
+    """
+    Nadstavbová funkce:
+      1) načte sekce za '|'
+      2) v konzoli nabídne volbu (název sekce nebo 'vše')
+      3) projde listing vybrané/ých sekcí
+      4) pro každý produkt zavolá scrape_product_data(url, excel_file, headless)
+      5) stránkuje přes ?p=2, ?p=3, ...
+    """
+
+    print("[it-market] Čtu sekce z hlavní stránky…")
+    sections = _after_pipe_product_sections(HOMEPAGE)
+    names = list(sections.keys())
+
+    print("\nDostupné sekce (za '|'):")
+    for i, n in enumerate(names, 1):
+        print(f"  {i}. {n}")
+    print("  * napiš 'vše' pro zpracování všech sekcí")
+
+    choice = input("\nCo chceš zpracovat? (název sekce nebo 'vše'): ").strip()
+
+    # vyber seznam (vše vs. konkrétní)
+    if choice.lower() in ("vse", "vše", "all", "everything"):
+        picked = names
+    else:
+        # dovolíme zadat název nebo index
+        if choice.isdigit():
+            idx = int(choice)
+            if not (1 <= idx <= len(names)):
+                print("Neplatný index sekce.")
+                return
+            picked = [names[idx - 1]]
+        else:
+            # case-insensitive match jména
+            matching = [n for n in names if n.lower() == choice.lower()]
+            if not matching:
+                # zkuste částečnou shodu
+                matching = [n for n in names if choice.lower() in n.lower()]
+            if not matching:
+                print("Sekce nenalezena.")
+                return
+            picked = [matching[0]]
+
+    seen_urls = set()
+
+    for sec_name in picked:
+        sec_url = sections[sec_name]
+        print(f"\n=== Sekce: {sec_name} → {sec_url} ===")
+
+        total_products = 0
+        for page_num, soup in _iter_listing_pages(sec_url, start_page=1, max_pages=max_pages_per_section):
+            print(f"[{sec_name}] Stránka {page_num}…")
+            product_links = _extract_product_links(soup)
+            if not product_links:
+                print(f"[{sec_name}] Na stránce {page_num} nejsou žádné produkty → končím sekci.")
+                break
+
+            for link in product_links:
+                url = _normalize_en_url(link)
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+
+                print(f"  → produkt: {url}")
+                try:
+                    # Volání existující funkce na detail (selenium), Excel appenduje sama
+                    scrape_product_data(url, excel_file=excel_file, headless=headless)
+                except Exception as e:
+                    print(f"    ! chyba při zpracování produktu: {e}")
+
+                total_products += 1
+                if delay_between_requests:
+                    time.sleep(delay_between_requests)
+
+        print(f"[{sec_name}] Hotovo. Zpracováno produktů: {total_products}")
+
 
 if __name__ == "__main__":
-    scrape_product_data(
-        'https://it-market.com/en/communication/wireless/access-points/ubiquiti/uap-ac-m-pro',
-        excel_file='product_data.xlsx',
-        headless=True
+    # Příklad běhu nadstavby:
+    # - nechá tě vybrat sekci nebo 'vše'
+    # - zapisuje do product_data.xlsx
+    # - product detaily se otevírají v headless Chromu
+    run_it_market_scraper(
+        excel_file="product_data.xlsx",
+        headless=True,
+        delay_between_requests=0.5,
+        max_pages_per_section=None  # nebo např. 3 pro rychlý test
     )
