@@ -1,3 +1,4 @@
+import csv
 import json
 import re
 import time
@@ -364,21 +365,59 @@ def _clear_progress():
         pass
 
 
-def _resolve_excel_path(excel_file: str | Path) -> Path:
-    p = Path(excel_file)
+def _resolve_output_path(output_file: str | Path) -> Path:
+    p = Path(output_file)
     if not p.is_absolute():
-        p = SCRIPT_DIR / p  # ukládej relativní cesty vedle skriptu
-    p.parent.mkdir(parents=True, exist_ok=True)  # jistota, že adresář existuje
+        p = SCRIPT_DIR / p
+    p.parent.mkdir(parents=True, exist_ok=True)
     return p
 
-def scrape_product_data(url, excel_file='product_data.xlsx', headless=True):
+
+def save_to_excel(data, excel_path):
+    """Save data to Excel file"""
+    try:
+        wb = openpyxl.load_workbook(excel_path)
+        sheet = wb.active
+        dbg(f"Načítám existující Excel: {excel_path}")
+    except FileNotFoundError:
+        wb = Workbook()
+        sheet = wb.active
+        headers = [
+            'Product Name', 'Variant Type', 'Price', 'Net Price', 'Stock Status',
+            'Quantity Available', 'Delivery Time', 'Product Number', 'Images',
+            'Description & Properties', 'Category Path'
+        ]
+        sheet.append(headers)
+        dbg(f"Vytvářím nový Excel: {excel_path}")
+
+    sheet.append(data)
+    wb.save(excel_path)
+
+
+def save_to_csv(data, csv_path):
+    """Save data to CSV file"""
+    file_exists = csv_path.exists()
+
+    with open(csv_path, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            headers = [
+                'Product Name', 'Variant Type', 'Price', 'Net Price', 'Stock Status',
+                'Quantity Available', 'Delivery Time', 'Product Number', 'Images',
+                'Description & Properties', 'Category Path'
+            ]
+            writer.writerow(headers)
+        writer.writerow(data)
+
+
+def scrape_product_data(url, output_file, file_format, headless=True):
     # /de/ -> /en/
     parsed = urlparse(url)
     if '/de/' in parsed.path:
         parsed = parsed._replace(path=parsed.path.replace('/de/', '/en/'))
         url = urlunparse(parsed)
 
-    excel_path = _resolve_excel_path(excel_file)
+    output_path = _resolve_output_path(output_file)
 
     driver = chrome_driver(headless=headless)
     dbg(f"Otevírám URL: {url}")
@@ -390,43 +429,26 @@ def scrape_product_data(url, excel_file='product_data.xlsx', headless=True):
         )
         dbg("Stránka načtena, varianty viditelné.")
 
-        # Excel
-        try:
-            wb = openpyxl.load_workbook(excel_path)
-            sheet = wb.active
-            dbg(f"Načítám existující Excel: {excel_file}")
-        except FileNotFoundError:
-            wb = Workbook()
-            sheet = wb.active
-            headers = [
-                'Product Name', 'Variant Type', 'Price', 'Net Price', 'Stock Status',
-                'Quantity Available', 'Delivery Time', 'Product Number', 'Images',
-                'Description & Properties', 'Category Path'
-            ]
-            sheet.append(headers)
-            dbg(f"Vytvářím nový Excel: {excel_file}")
-
         # kolik variant?
         radios = driver.find_elements(By.CSS_SELECTOR, '.product-detail-configurator-option input[type="radio"]')
         total = max(1, len(radios))
         dbg(f"Nalezeno variant: {total}")
 
-        # === mapování pro číslování DLE DUPLICIT ===
-        # klíč: f"{base_name}_{variant_type}" -> počet výskytů
+        # mapování pro číslování DLE DUPLICIT
         name_counts = {}
 
         for i in range(total):
-            dbg(f"=== Zpracovávám variantu {i+1}/{total} ===")
+            dbg(f"=== Zpracovávám variantu {i + 1}/{total} ===")
             try:
                 input_id, _label = safe_click_variant_by_index(driver, i)
                 dbg(f"Vybraná varianta input_id={input_id}")
             except Exception as e:
-                dbg(f"Chyba při výběru varianty {i+1}: {e}")
+                dbg(f"Chyba při výběru varianty {i + 1}: {e}")
 
             try:
                 d = extract_variant_data(driver)
             except Exception as e:
-                dbg(f"Chyba při čtení dat varianty {i+1}: {e}")
+                dbg(f"Chyba při čtení dat varianty {i + 1}: {e}")
                 d = {
                     'base_name': 'N/A', 'variant_type': 'N/A', 'price': 'N/A', 'net_price': 'N/A',
                     'stock_status': 'N/A', 'quantity_available': 'N/A', 'delivery_time': 'N/A',
@@ -434,7 +456,7 @@ def scrape_product_data(url, excel_file='product_data.xlsx', headless=True):
                     'category_path': 'N/A'
                 }
 
-            # === vytvoření Product Name s číslováním jen u duplicit ===
+            # vytvoření Product Name s číslováním jen u duplicit
             base = d.get('base_name', 'N/A')
             vtype = d.get('variant_type', 'N/A')
             key = f"{base}_{vtype}"
@@ -459,14 +481,19 @@ def scrape_product_data(url, excel_file='product_data.xlsx', headless=True):
                 d.get('description_and_properties', ''),
                 d.get('category_path', '')
             ]
-            sheet.append(row)
 
-        wb.save(excel_path)
-        dbg(f"Data uložena do {excel_path}")
+            # Uložení dat podle zvoleného formátu
+            if file_format == 'excel':
+                save_to_excel(row, output_path)
+            else:  # csv
+                save_to_csv(row, output_path)
+
+        dbg(f"Data uložena do {output_path}")
 
     finally:
         dbg("Ukončuji prohlížeč.")
         driver.quit()
+
 
 HOMEPAGE = "https://it-market.com/en"
 HEADERS = {
@@ -618,10 +645,38 @@ def _normalize_en_url(url: str) -> str:
     path = parsed.path.replace("/de/", "/en/")
     return urlunparse(parsed._replace(path=path))
 
-def run_it_market_scraper(excel_file: str = "product_data.xlsx",
-                          headless: bool = True,
-                          delay_between_requests: float = 0.6,
-                          max_pages_per_section: int | None = None):
+
+def run_it_market_scraper():
+    # Zeptat se na výstupní formát
+    print("Vyber výstupní formát:")
+    print("  1) Excel (.xlsx)")
+    print("  2) CSV (.csv)")
+    format_choice = input("Zadej 1 nebo 2: ").strip()
+
+    if format_choice == "1":
+        file_format = "excel"
+        default_file = "product_data.xlsx"
+    else:
+        file_format = "csv"
+        default_file = "product_data.csv"
+
+    output_file = input(f"Zadej název výstupního souboru (enter pro {default_file}): ").strip() or default_file
+
+    # Zkontrolovat příponu souboru
+    if file_format == "excel" and not output_file.endswith('.xlsx'):
+        output_file += '.xlsx'
+    elif file_format == "csv" and not output_file.endswith('.csv'):
+        output_file += '.csv'
+
+    # Zbytek parametrů
+    headless = input("Headless režim? (ano/ne, enter pro ano): ").strip().lower() != "ne"
+
+    delay_input = input("Zadej zpoždění mezi požadavky v sekundách (enter pro 0.5): ").strip()
+    delay_between_requests = float(delay_input) if delay_input else 0.5
+
+    max_pages_input = input("Maximální počet stránek na sekci (enter pro všechny): ").strip()
+    max_pages_per_section = int(max_pages_input) if max_pages_input else None
+
     print("[it-market] Čtu sekce z hlavní stránky…")
     sections = _after_pipe_product_sections(HOMEPAGE)
     names = list(sections.keys())
@@ -644,30 +699,28 @@ def run_it_market_scraper(excel_file: str = "product_data.xlsx",
                 return
             picked = [names[idx - 1]]
         else:
-            matching = [n for n in names if n.lower() == choice.lower()] or [n for n in names if choice.lower() in n.lower()]
+            matching = [n for n in names if n.lower() == choice.lower()] or [n for n in names if
+                                                                             choice.lower() in n.lower()]
             if not matching:
                 print("Sekce nenalezena.")
                 return
             picked = [matching[0]]
         picked_mode = "single"
 
-    # --- dotaz na start mód (auto/pokračovat od začátku/od bodu) ---
-    # Pokud je vybráno "vše" a existuje progress, automaticky navážeme (bez dotazu).
+    # Dotaz na start mód
     progress = _load_progress() if picked_mode == "all" else None
-    resume = None  # dict with {section,page,product_idx_on_page}
+    resume = None
 
     if picked_mode == "all" and progress:
         print(f"\n[Auto pokračování] Nalezen progress: {progress}")
         resume = progress
     else:
-        # není auto-progress, zeptáme se
         print("\nChceš pokračovat:")
         print("  1) od začátku")
         print("  2) od bodu")
         mode_choice = input("Vyber 1/2: ").strip()
         if mode_choice == "2":
             if picked_mode == "all":
-                # zeptáme se na sekci
                 sec_input = input("Zadej sekci pro start (název nebo index): ").strip()
                 if sec_input.isdigit():
                     sidx = int(sec_input)
@@ -676,7 +729,8 @@ def run_it_market_scraper(excel_file: str = "product_data.xlsx",
                         return
                     resume_section = names[sidx - 1]
                 else:
-                    mm = [n for n in names if n.lower() == sec_input.lower()] or [n for n in names if sec_input.lower() in n.lower()]
+                    mm = [n for n in names if n.lower() == sec_input.lower()] or [n for n in names if
+                                                                                  sec_input.lower() in n.lower()]
                     if not mm:
                         print("Sekce nenalezena.")
                         return
@@ -688,7 +742,7 @@ def run_it_market_scraper(excel_file: str = "product_data.xlsx",
             resume_prod = int(input("Zadej pořadí produktu na stránce (1–24): ").strip() or "1")
             resume = {"section": resume_section, "page": resume_page, "product_idx_on_page": resume_prod}
         else:
-            _clear_progress()  # když začínáme od začátku, smaž starý progress
+            _clear_progress()
 
     seen_urls = set()
 
@@ -697,7 +751,7 @@ def run_it_market_scraper(excel_file: str = "product_data.xlsx",
         print(f"\n=== Sekce: {sec_name} → {sec_url} ===")
         total_products = 0
 
-        # Nastav startovací bod pro aktuální sekci, pokud máme „resume“
+        # Nastav startovací bod pro aktuální sekci
         start_page = 1
         start_product_idx = 1
         if resume and resume.get("section") == sec_name:
@@ -729,11 +783,11 @@ def run_it_market_scraper(excel_file: str = "product_data.xlsx",
                 print(f"  → produkt: {idx_on_page}/24")
                 print(f"  → url: {url}")
                 try:
-                    scrape_product_data(url, excel_file=excel_file, headless=headless)
+                    scrape_product_data(url, output_file=output_file, file_format=file_format, headless=headless)
                 except Exception as e:
                     print(f"    ! chyba při zpracování produktu: {e}")
 
-                # ⬅ ukládej progress po každém produktu
+                # Ukládej progress po každém produktu
                 _save_progress(sec_name, page_num, idx_on_page, url)
 
                 total_products += 1
@@ -751,9 +805,4 @@ if __name__ == "__main__":
     # - nechá tě vybrat sekci nebo 'vše'
     # - zapisuje do product_data.xlsx
     # - product detaily se otevírají v headless Chromu
-    run_it_market_scraper(
-        excel_file="product_data.xlsx",
-        headless=True,
-        delay_between_requests=0.5,
-        max_pages_per_section=None  # nebo např. 3 pro rychlý test
-    )
+    run_it_market_scraper()
