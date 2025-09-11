@@ -1,30 +1,7 @@
+import json
 import re
 import time
-from pathlib import Path
-from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
-
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import (
-    TimeoutException, NoSuchElementException, StaleElementReferenceException
-)
-
-import openpyxl
-from openpyxl import Workbook
-
-import requests
-from bs4 import BeautifulSoup
-
-
-
-def dbg(msg):
-    ts = time.strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}")
-
-import re
-import time
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
 
@@ -47,6 +24,11 @@ from webdriver_manager.chrome import ChromeDriverManager  # Fixed missing import
 import platform
 import shutil
 from selenium.webdriver.chrome.service import Service as ChromeService
+from requests.exceptions import HTTPError, Timeout, ConnectionError as ReqConnError
+
+def dbg(msg):
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}")
 
 # === Cross-platform Selenium config ===
 # Choose your browser without prompts:
@@ -120,8 +102,6 @@ def chrome_driver(headless=True,
         service = ChromeService(executable_path=path)
 
     return webdriver.Chrome(options=opts, service=service)
-
-# The rest of the code remains unchanged
 
 
 def safe_click_variant_by_index(driver, idx, timeout=15, max_retries=3):
@@ -356,6 +336,34 @@ def extract_variant_data(driver):
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
+PROGRESS_FILE = SCRIPT_DIR / "posledni_zpracovanej_produkt.json"
+
+def _save_progress(section: str, page: int, product_idx_on_page: int, url: str):
+    data = {
+        "section": section,
+        "page": page,
+        "product_idx_on_page": product_idx_on_page,
+        "url": url,
+        "ts": datetime.utcnow().isoformat() + "Z",
+    }
+    PROGRESS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+
+def _load_progress():
+    if PROGRESS_FILE.exists():
+        try:
+            return json.loads(PROGRESS_FILE.read_text())
+        except Exception:
+            return None
+    return None
+
+def _clear_progress():
+    try:
+        if PROGRESS_FILE.exists():
+            PROGRESS_FILE.unlink()
+    except Exception:
+        pass
+
+
 def _resolve_excel_path(excel_file: str | Path) -> Path:
     p = Path(excel_file)
     if not p.is_absolute():
@@ -467,11 +475,43 @@ HEADERS = {
                   "Chrome/123.0.0.0 Safari/537.36"
 }
 
-def _soup_get(url: str, timeout: int = 20) -> BeautifulSoup:
-    """GET → BeautifulSoup s rozumnými hlavičkami a timeoutem."""
-    r = requests.get(url, headers=HEADERS, timeout=timeout)
-    r.raise_for_status()
-    return BeautifulSoup(r.text, "html.parser")
+
+
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+class MaintenanceError(RuntimeError):
+    pass
+
+def _soup_get(url: str, timeout: int = 20, max_retries: int = 5, backoff_base: float = 0.8) -> BeautifulSoup:
+    """
+    GET s rozumnými hlavičkami, retry a detekcí /maintenance.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+            # Když nás web přesměruje na maintenance, vyhoď speciální výjimku
+            if r.url.endswith("/maintenance") or r.status_code == 503:
+                raise MaintenanceError(f"Maintenance mode ({r.status_code}) at {r.url}")
+            r.raise_for_status()
+            return BeautifulSoup(r.text, "html.parser")
+        except (Timeout, ReqConnError) as e:
+            # Síťové potíže -> retry
+            if attempt > max_retries:
+                raise
+        except HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            # Retry jen pro dočasné kódy
+            if status not in RETRY_STATUSES or attempt > max_retries:
+                raise
+        except MaintenanceError:
+            # Maintenance: zkusíme chvíli počkat a zkusit znova
+            if attempt > max_retries:
+                raise
+        # backoff
+        sleep_for = backoff_base * (2 ** (attempt - 1)) + (0.05 * attempt)
+        time.sleep(sleep_for)
 
 def _after_pipe_product_sections(homepage_url: str = HOMEPAGE):
     """
@@ -528,7 +568,13 @@ def _iter_listing_pages(section_url: str, start_page: int = 1, max_pages: int | 
         new_q = urlencode(q, doseq=True)
         page_url = urlunparse(parsed._replace(query=new_q))
 
-        soup = _soup_get(page_url)
+        try:
+            soup = _soup_get(page_url)
+        except MaintenanceError as e:
+            dbg(f"[MAINTENANCE] {e} – čekám 2 minuty a zkusím to znovu…")
+            time.sleep(120)
+            # po pauze to zkus znova bez zvýšení page counteru
+            continue
 
         # chyba stránky (když přejedeme počet stránek)
         err = soup.select_one("div.alert.alert-danger .alert-content")
@@ -576,15 +622,6 @@ def run_it_market_scraper(excel_file: str = "product_data.xlsx",
                           headless: bool = True,
                           delay_between_requests: float = 0.6,
                           max_pages_per_section: int | None = None):
-    """
-    Nadstavbová funkce:
-      1) načte sekce za '|'
-      2) v konzoli nabídne volbu (název sekce nebo 'vše')
-      3) projde listing vybrané/ých sekcí
-      4) pro každý produkt zavolá scrape_product_data(url, excel_file, headless)
-      5) stránkuje přes ?p=2, ?p=3, ...
-    """
-
     print("[it-market] Čtu sekce z hlavní stránky…")
     sections = _after_pipe_product_sections(HOMEPAGE)
     names = list(sections.keys())
@@ -596,11 +633,10 @@ def run_it_market_scraper(excel_file: str = "product_data.xlsx",
 
     choice = input("\nCo chceš zpracovat? (název sekce nebo 'vše'): ").strip()
 
-    # vyber seznam (vše vs. konkrétní)
     if choice.lower() in ("vse", "vše", "all", "everything"):
         picked = names
+        picked_mode = "all"
     else:
-        # dovolíme zadat název nebo index
         if choice.isdigit():
             idx = int(choice)
             if not (1 <= idx <= len(names)):
@@ -608,31 +644,82 @@ def run_it_market_scraper(excel_file: str = "product_data.xlsx",
                 return
             picked = [names[idx - 1]]
         else:
-            # case-insensitive match jména
-            matching = [n for n in names if n.lower() == choice.lower()]
-            if not matching:
-                # zkuste částečnou shodu
-                matching = [n for n in names if choice.lower() in n.lower()]
+            matching = [n for n in names if n.lower() == choice.lower()] or [n for n in names if choice.lower() in n.lower()]
             if not matching:
                 print("Sekce nenalezena.")
                 return
             picked = [matching[0]]
+        picked_mode = "single"
+
+    # --- dotaz na start mód (auto/pokračovat od začátku/od bodu) ---
+    # Pokud je vybráno "vše" a existuje progress, automaticky navážeme (bez dotazu).
+    progress = _load_progress() if picked_mode == "all" else None
+    resume = None  # dict with {section,page,product_idx_on_page}
+
+    if picked_mode == "all" and progress:
+        print(f"\n[Auto pokračování] Nalezen progress: {progress}")
+        resume = progress
+    else:
+        # není auto-progress, zeptáme se
+        print("\nChceš pokračovat:")
+        print("  1) od začátku")
+        print("  2) od bodu")
+        mode_choice = input("Vyber 1/2: ").strip()
+        if mode_choice == "2":
+            if picked_mode == "all":
+                # zeptáme se na sekci
+                sec_input = input("Zadej sekci pro start (název nebo index): ").strip()
+                if sec_input.isdigit():
+                    sidx = int(sec_input)
+                    if not (1 <= sidx <= len(names)):
+                        print("Neplatný index sekce.")
+                        return
+                    resume_section = names[sidx - 1]
+                else:
+                    mm = [n for n in names if n.lower() == sec_input.lower()] or [n for n in names if sec_input.lower() in n.lower()]
+                    if not mm:
+                        print("Sekce nenalezena.")
+                        return
+                    resume_section = mm[0]
+            else:
+                resume_section = picked[0]
+
+            resume_page = int(input("Zadej číslo stránky (p >= 1): ").strip() or "1")
+            resume_prod = int(input("Zadej pořadí produktu na stránce (1–24): ").strip() or "1")
+            resume = {"section": resume_section, "page": resume_page, "product_idx_on_page": resume_prod}
+        else:
+            _clear_progress()  # když začínáme od začátku, smaž starý progress
 
     seen_urls = set()
 
     for sec_name in picked:
         sec_url = sections[sec_name]
         print(f"\n=== Sekce: {sec_name} → {sec_url} ===")
-
         total_products = 0
-        for page_num, soup in _iter_listing_pages(sec_url, start_page=1, max_pages=max_pages_per_section):
+
+        # Nastav startovací bod pro aktuální sekci, pokud máme „resume“
+        start_page = 1
+        start_product_idx = 1
+        if resume and resume.get("section") == sec_name:
+            start_page = max(1, int(resume.get("page", 1)))
+            start_product_idx = max(1, int(resume.get("product_idx_on_page", 1)))
+
+        page_iter = _iter_listing_pages(sec_url, start_page=start_page, max_pages=max_pages_per_section)
+
+        for page_num, soup in page_iter:
             print(f"[{sec_name}] Stránka {page_num}…")
             product_links = _extract_product_links(soup)
             if not product_links:
                 print(f"[{sec_name}] Na stránce {page_num} nejsou žádné produkty → končím sekci.")
                 break
 
-            for idx_on_page,link in enumerate(product_links, start=1):
+            # Pokud navazujeme uprostřed stránky, přeskoč prvních N-1 produktů
+            first_idx = start_product_idx if page_num == start_page else 1
+
+            for idx_on_page, link in enumerate(product_links, start=1):
+                if idx_on_page < first_idx:
+                    continue
+
                 url = _normalize_en_url(link)
                 if url in seen_urls:
                     continue
@@ -642,14 +729,19 @@ def run_it_market_scraper(excel_file: str = "product_data.xlsx",
                 print(f"  → produkt: {idx_on_page}/24")
                 print(f"  → url: {url}")
                 try:
-                    # Volání existující funkce na detail (selenium), Excel appenduje sama
                     scrape_product_data(url, excel_file=excel_file, headless=headless)
                 except Exception as e:
                     print(f"    ! chyba při zpracování produktu: {e}")
 
+                # ⬅ ukládej progress po každém produktu
+                _save_progress(sec_name, page_num, idx_on_page, url)
+
                 total_products += 1
                 if delay_between_requests:
                     time.sleep(delay_between_requests)
+
+            # po první stránce už nepokračujeme „od prostředka“
+            start_product_idx = 1
 
         print(f"[{sec_name}] Hotovo. Zpracováno produktů: {total_products}")
 
