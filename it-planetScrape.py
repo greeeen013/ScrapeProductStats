@@ -301,17 +301,28 @@ def scrape_product_page(url, is_refurbished=False):
             else:
                 product_name += "_new"
 
-        # Cena
+        # Cena - upravené zpracování
         price = "N/A"
         price_elem = soup.find("div", class_="product--price")
         if price_elem:
-            price_content = price_elem.find("span", class_="price--content")
-            if price_content:
-                price = price_content.text.strip()
+            # Odstranit "From" a hvězdičku, zachovat pouze číselnou část s měnou
+            price_text = price_elem.text.strip()
+
+            # Odstranit "From" pokud existuje
+            if price_text.startswith("From"):
+                price_text = price_text.replace("From", "").strip()
+
+            # Odstranit hvězdičku pokud existuje
+            if "*" in price_text:
+                price_text = price_text.replace("*", "").strip()
+
+            # Najít část s cenou a měnou (např. 190.00€)
+            price_match = re.search(r'(\d+[\d\.,]*\s*€|\$|£)', price_text)
+            if price_match:
+                price = price_match.group(1).strip()
             else:
-                price_text = price_elem.text.strip()
-                if "Price on request" not in price_text:
-                    price = price_text
+                # Pokud nenajde formátovanou cenu, použije celý text (bez From a *)
+                price = price_text if price_text and "Price on request" not in price_text else "N/A"
 
         # Dodací doba
         delivery_time = "N/A"
@@ -365,18 +376,27 @@ def scrape_product_page(url, is_refurbished=False):
             else:
                 description = desc_elem.text.strip().replace("\n", " ").replace("\t", " ")
 
-        # Kategorie
+        # Kategorie - upravené zpracování z breadcrumb navigace
         category_path = "N/A"
-        breadcrumbs = soup.find("div", class_="breadcrumb--container")
-        if breadcrumbs:
-            categories = []
-            breadcrumb_links = breadcrumbs.find_all("a", class_="breadcrumb--link")
-            for link in breadcrumb_links:
-                if link.text.strip() and "Home" not in link.text:
-                    categories.append(link.text.strip())
+        breadcrumb_container = soup.find("div", class_="breadcrumb--container")
+        if breadcrumb_container:
+            breadcrumb_list = breadcrumb_container.find("ul", class_="breadcrumb--list")
+            if breadcrumb_list:
+                categories = []
+                breadcrumb_entries = breadcrumb_list.find_all("li", class_="breadcrumb--entry")
 
-            if categories:
-                category_path = " > ".join(categories)
+                for entry in breadcrumb_entries:
+                    # Přeskočit ikonu domu a separátory
+                    if "breadcrumb--icon" in str(entry) or "breadcrumb--separator" in str(entry):
+                        continue
+
+                    # Najít název kategorie
+                    title_span = entry.find("span", class_="breadcrumb--title")
+                    if title_span and title_span.text.strip() and title_span.text.strip() != "Home":
+                        categories.append(title_span.text.strip())
+
+                if categories:
+                    category_path = " > ".join(categories)
 
         return {
             "product_name": product_name,
