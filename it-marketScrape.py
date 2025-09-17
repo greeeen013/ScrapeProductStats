@@ -5,6 +5,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -20,42 +22,32 @@ from openpyxl import Workbook
 import requests
 from bs4 import BeautifulSoup
 
-from webdriver_manager.chrome import ChromeDriverManager  # Fixed missing import
+from webdriver_manager.chrome import ChromeDriverManager
 
 import platform
 import shutil
 from selenium.webdriver.chrome.service import Service as ChromeService
 from requests.exceptions import HTTPError, Timeout, ConnectionError as ReqConnError
 
+
 def dbg(msg):
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] {msg}")
 
+
 # === Cross-platform Selenium config ===
-# Choose your browser without prompts:
-#   "chrome"   -> Google Chrome
-#   "chromium" -> Chromium (useful on Raspberry Pi OS / Debian)
-BROWSER_CHOICE = "chromium"  # change to "chrome" on Windows if you prefer
-
-# How to find chromedriver:
-#   "auto"   -> use webdriver-manager (great on Windows; downloads correct driver automatically)
-#   "system" -> use chromedriver from PATH or CHROMEDRIVER_PATH
+BROWSER_CHOICE = "chromium"
 DRIVER_MODE = "auto" if platform.system() == "Windows" else "system"
+CHROMIUM_BINARY = None
+CHROMEDRIVER_PATH = None
 
-# Optional overrides (leave as None to auto-detect sensible defaults)
-CHROMIUM_BINARY = None  # e.g., "/usr/bin/chromium" or "/usr/bin/chromium-browser"
-CHROMEDRIVER_PATH = None  # e.g., "/usr/bin/chromedriver" on Raspberry Pi
 
 def chrome_driver(headless=True,
                   browser_choice: str | None = None,
                   driver_mode: str | None = None,
                   chromium_binary: str | None = None,
                   chromedriver_path: str | None = None):
-    """Create a Chrome/Chromium WebDriver that works on Windows and Raspberry Pi.
-
-    Parameters allow selecting Chrome vs Chromium and how to locate the driver.
-    They have sensible defaults from the module-level constants above.
-    """
+    """Create a Chrome/Chromium WebDriver that works on Windows and Raspberry Pi."""
     bc = (browser_choice or BROWSER_CHOICE or "chromium").lower()
     dm = (driver_mode or DRIVER_MODE or "system").lower()
     binary_override = chromium_binary or CHROMIUM_BINARY
@@ -63,37 +55,30 @@ def chrome_driver(headless=True,
 
     opts = webdriver.ChromeOptions()
     if headless:
-        # \"new\" headless is correct for Chromium 109+
         opts.add_argument("--headless=new")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--window-size=1400,1600")
 
-    # If user wants Chromium, set binary; try to autodetect common paths on Linux
     if bc == "chromium":
         if binary_override:
             opts.binary_location = binary_override
         else:
-            # try common Linux paths
             for candidate in ("/usr/bin/chromium", "/usr/bin/chromium-browser"):
                 if Path(candidate).exists():
                     opts.binary_location = candidate
                     break
 
-    # Build the Service depending on mode
     service = None
     if dm == "auto":
         try:
             service = ChromeService(ChromeDriverManager().install())
-        except Exception as e:
-            # Fallback to system if webdriver-manager isn't available/working
+        except Exception:
             dm = "system"
 
     if dm == "system":
-        # Use explicit override, PATH, or common default on Linux
         path = driver_override or shutil.which("chromedriver")
         if not path and platform.system() != "Windows":
-            # Typical Raspberry Pi location
             for candidate in ("/usr/bin/chromedriver", "/snap/bin/chromium.chromedriver"):
                 if Path(candidate).exists():
                     path = candidate
@@ -149,11 +134,7 @@ def safe_click_variant_by_index(driver, idx, timeout=15, max_retries=3):
 
 
 def _parse_price_block_text(text):
-    """
-    Rozparsuje blok s cenou typu:
-      '€166.60*\\nNet: €140.00'
-    a vrátí (price, net_price) bez hvězdiček a s ořezanými mezerami.
-    """
+    """Rozparsuje blok s cenou."""
     cleaned = text.replace('*', '').strip()
     lines = [l.strip() for l in cleaned.splitlines() if l.strip()]
     price = 'N/A'
@@ -175,18 +156,15 @@ def _collect_description_and_properties_from_pane(driver, timeout=15):
     def _norm(txt: str) -> str:
         if txt is None:
             return ""
-        # sjednotí whitespace, odstraní NBSP a ořeže
         txt = txt.replace("\xa0", " ")
         txt = re.sub(r"\s+", " ", txt)
         return txt.strip()
 
-    # 1) Najdi panel a případně ho rozbal
     pane = WebDriverWait(driver, timeout).until(
         EC.presence_of_element_located((By.ID, "description-tab-pane"))
     )
 
     try:
-        # pokud není rozbalený, rozbalit přes tlačítko s aria-controls
         if "show" not in (pane.get_attribute("class") or ""):
             btn = driver.find_element(By.CSS_SELECTOR, 'button[aria-controls="description-tab-pane"]')
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
@@ -195,10 +173,8 @@ def _collect_description_and_properties_from_pane(driver, timeout=15):
                 lambda d: "show" in d.find_element(By.ID, "description-tab-pane").get_attribute("class")
             )
     except Exception:
-        # když se nepodaří rozbalit, pokračujeme i tak (někdy jde text vyčíst i ze skrytého obsahu)
         pass
 
-    # 2) Popisek – primárně z .product-detail-description-text, fallback z tlačítka "Description ..."
     description = ""
     try:
         desc_elem = pane.find_element(By.CSS_SELECTOR, ".product-detail-description-text")
@@ -210,7 +186,6 @@ def _collect_description_and_properties_from_pane(driver, timeout=15):
         try:
             btn = driver.find_element(By.CSS_SELECTOR, 'button[aria-controls="description-tab-pane"]')
             btn_text = _norm(btn.get_attribute("textContent"))
-            # odeber úvodní "Description"
             if btn_text.lower().startswith("description"):
                 description = _norm(btn_text[len("description"):])
             else:
@@ -218,7 +193,6 @@ def _collect_description_and_properties_from_pane(driver, timeout=15):
         except Exception:
             description = ""
 
-    # 3) Parametry: projít všechny řádky tabulky
     properties = []
     try:
         rows = pane.find_elements(By.CSS_SELECTOR, "table.product-detail-properties-table tr.properties-row")
@@ -226,10 +200,8 @@ def _collect_description_and_properties_from_pane(driver, timeout=15):
             try:
                 label_elem = row.find_element(By.CSS_SELECTOR, ".properties-label")
                 value_elem = row.find_element(By.CSS_SELECTOR, ".properties-value")
-
                 label = _norm(label_elem.get_attribute("textContent")).rstrip(":")
                 value = _norm(value_elem.get_attribute("textContent"))
-
                 if label and value:
                     properties.append(f"{label}: {value}")
             except Exception:
@@ -237,31 +209,21 @@ def _collect_description_and_properties_from_pane(driver, timeout=15):
     except Exception:
         pass
 
-    # 4) Sestavit výsledek: popisek; Klíč: Hodnota; Klíč: Hodnota; ...
     parts = [description] if description else []
     parts.extend(properties)
     return "; ".join(parts)
 
 
-
 def extract_variant_data(driver):
-    """
-    Vrací dict bez číslovaného názvu:
-      base_name, variant_type, price, net_price, stock_status, quantity_available,
-      delivery_time, product_number, images, description_and_properties, category_path
-    """
+    """Vrací dict bez číslovaného názvu."""
     data = {}
 
-    # vybraná varianta – typ + ceny + stock
     try:
         checked = driver.find_element(By.CSS_SELECTOR, 'input[type="radio"]:checked')
         label = driver.find_element(By.CSS_SELECTOR, f'label[for="{checked.get_attribute("id")}"]')
-
-        # typ/label title
         variant_title_el = label.find_element(By.CLASS_NAME, 'product-detail-configurator-option-label-title')
         data['variant_type'] = variant_title_el.text.split('\n')[0].strip()
 
-        # ceny
         price_block = None
         try:
             price_block = label.find_element(By.CLASS_NAME, 'product-detail-configurator-option-label-prices')
@@ -274,49 +236,41 @@ def extract_variant_data(driver):
         data['price'] = price
         data['net_price'] = net_price
 
-        # stock/delivery u varianty
         stock_elem = label.find_elements(By.CLASS_NAME, 'product-detail-configurator-option-inStock')
         delivery_elem = label.find_elements(By.CLASS_NAME, 'product-detail-configurator-option-withDelivery')
         data['stock_status'] = stock_elem[0].text if stock_elem else (delivery_elem[0].text if delivery_elem else 'N/A')
     except NoSuchElementException:
         data.update({'variant_type': 'N/A', 'price': 'N/A', 'net_price': 'N/A', 'stock_status': 'N/A'})
 
-    # název produktu (bez číslování)
     try:
         data['base_name'] = driver.find_element(By.CLASS_NAME, 'product-detail-name').text.strip()
     except NoSuchElementException:
         data['base_name'] = 'N/A'
 
-    # množství skladem
     try:
         data['quantity_available'] = driver.find_element(By.CLASS_NAME, 'product-detail-quantity-available').text
     except NoSuchElementException:
         data['quantity_available'] = 'N/A'
 
-    # dodací doba
     try:
         el = driver.find_element(By.CSS_SELECTOR, '.delivery-information.delivery-available, .delivery-information')
         data['delivery_time'] = el.text.strip()
     except NoSuchElementException:
         data['delivery_time'] = 'N/A'
 
-    # číslo produktu
     try:
         data['product_number'] = driver.find_element(By.CLASS_NAME, 'product-detail-ordernumber').text.strip()
     except NoSuchElementException:
         data['product_number'] = 'N/A'
 
-    # obrázky
     try:
         images = driver.find_elements(By.CSS_SELECTOR, '.gallery-slider-thumbnails-item img')
         data['images'] = '; '.join([img.get_attribute('src') for img in images if img.get_attribute('src')])
     except NoSuchElementException:
         data['images'] = 'N/A'
 
-    # description + properties **jen z description panelu**
     data['description_and_properties'] = _collect_description_and_properties_from_pane(driver)
 
-    # breadcrumbs
     try:
         breadcrumbs = driver.find_elements(By.CSS_SELECTOR, '.breadcrumb-item a.breadcrumb-link')
         categories = []
@@ -332,12 +286,13 @@ def extract_variant_data(driver):
     except NoSuchElementException:
         data['category_path'] = 'N/A'
 
-    dbg(f"→ {data.get('base_name','N/A')} | {data.get('variant_type','N/A')} | {data.get('price','N/A')} | {data.get('net_price','N/A')}")
+    dbg(f"→ {data.get('base_name', 'N/A')} | {data.get('variant_type', 'N/A')} | {data.get('price', 'N/A')} | {data.get('net_price', 'N/A')}")
     return data
 
-SCRIPT_DIR = Path(__file__).resolve().parent
 
+SCRIPT_DIR = Path(__file__).resolve().parent
 PROGRESS_FILE = SCRIPT_DIR / "posledni_zpracovanej_produkt.json"
+
 
 def _save_progress(section: str, page: int, product_idx_on_page: int, url: str):
     data = {
@@ -349,6 +304,7 @@ def _save_progress(section: str, page: int, product_idx_on_page: int, url: str):
     }
     PROGRESS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
+
 def _load_progress():
     if PROGRESS_FILE.exists():
         try:
@@ -356,6 +312,7 @@ def _load_progress():
         except Exception:
             return None
     return None
+
 
 def _clear_progress():
     try:
@@ -373,54 +330,56 @@ def _resolve_output_path(output_file: str | Path) -> Path:
     return p
 
 
-def save_to_excel(data, excel_path):
-    """Save data to Excel file"""
-    try:
-        wb = openpyxl.load_workbook(excel_path)
-        sheet = wb.active
-        dbg(f"Načítám existující Excel: {excel_path}")
-    except FileNotFoundError:
-        wb = Workbook()
-        sheet = wb.active
-        headers = [
-            'Product Name', 'Variant Type', 'Price', 'Net Price', 'Stock Status',
-            'Quantity Available', 'Delivery Time', 'Product Number', 'Images',
-            'Description & Properties', 'Category Path'
-        ]
-        sheet.append(headers)
-        dbg(f"Vytvářím nový Excel: {excel_path}")
-
-    sheet.append(data)
-    wb.save(excel_path)
+write_lock = threading.Lock()
+progress_lock = threading.Lock()
 
 
-def save_to_csv(data, csv_path):
-    """Save data to CSV file"""
-    file_exists = csv_path.exists()
+def save_data_batch(rows, output_path, file_format):
+    """Uloží dávku dat s thread-safe přístupem"""
+    with write_lock:
+        if file_format == 'excel':
+            try:
+                wb = openpyxl.load_workbook(output_path)
+                sheet = wb.active
+            except FileNotFoundError:
+                wb = Workbook()
+                sheet = wb.active
+                headers = [
+                    'Product Name', 'Variant Type', 'Price', 'Net Price', 'Stock Status',
+                    'Quantity Available', 'Delivery Time', 'Product Number', 'Images',
+                    'Description & Properties', 'Category Path'
+                ]
+                sheet.append(headers)
 
-    with open(csv_path, 'a', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            headers = [
-                'Product Name', 'Variant Type', 'Price', 'Net Price', 'Stock Status',
-                'Quantity Available', 'Delivery Time', 'Product Number', 'Images',
-                'Description & Properties', 'Category Path'
-            ]
-            writer.writerow(headers)
-        writer.writerow(data)
+            for row in rows:
+                sheet.append(row)
+
+            wb.save(output_path)
+        else:  # csv
+            file_exists = output_path.exists()
+            with open(output_path, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    headers = [
+                        'Product Name', 'Variant Type', 'Price', 'Net Price', 'Stock Status',
+                        'Quantity Available', 'Delivery Time', 'Product Number', 'Images',
+                        'Description & Properties', 'Category Path'
+                    ]
+                    writer.writerow(headers)
+                for row in rows:
+                    writer.writerow(row)
 
 
 def scrape_product_data(url, output_file, file_format, headless=True):
-    # /de/ -> /en/
     parsed = urlparse(url)
     if '/de/' in parsed.path:
         parsed = parsed._replace(path=parsed.path.replace('/de/', '/en/'))
         url = urlunparse(parsed)
 
-    output_path = _resolve_output_path(output_file)
-
     driver = chrome_driver(headless=headless)
     dbg(f"Otevírám URL: {url}")
+
+    all_rows = []
 
     try:
         driver.get(url)
@@ -429,12 +388,10 @@ def scrape_product_data(url, output_file, file_format, headless=True):
         )
         dbg("Stránka načtena, varianty viditelné.")
 
-        # kolik variant?
         radios = driver.find_elements(By.CSS_SELECTOR, '.product-detail-configurator-option input[type="radio"]')
         total = max(1, len(radios))
         dbg(f"Nalezeno variant: {total}")
 
-        # mapování pro číslování DLE DUPLICIT
         name_counts = {}
 
         for i in range(total):
@@ -456,17 +413,11 @@ def scrape_product_data(url, output_file, file_format, headless=True):
                     'category_path': 'N/A'
                 }
 
-            # vytvoření Product Name s číslováním jen u duplicit
             base = d.get('base_name', 'N/A')
-            vtype = d.get('variant_type', 'N/A')
-            key = f"{base}_{vtype}"
-            name_counts[key] = name_counts.get(key, 0) + 1
-            if name_counts[key] == 1:
-                product_name = key
-            else:
-                product_name = f"{key}_{name_counts[key]}"
+            key = f"{base}"
+            product_name = key
             d['product_name'] = product_name
-            dbg(f"NAME key='{key}' -> '{product_name}' (count={name_counts[key]})")
+            dbg(f"NAME key='{key}' -> '{product_name}'")
 
             row = [
                 d.get('product_name', ''),
@@ -482,13 +433,10 @@ def scrape_product_data(url, output_file, file_format, headless=True):
                 d.get('category_path', '')
             ]
 
-            # Uložení dat podle zvoleného formátu
-            if file_format == 'excel':
-                save_to_excel(row, output_path)
-            else:  # csv
-                save_to_csv(row, output_path)
+            all_rows.append(row)
 
-        dbg(f"Data uložena do {output_path}")
+        dbg(f"Data připravena pro {url}")
+        return all_rows, url
 
     finally:
         dbg("Ukončuji prohlížeč.")
@@ -502,55 +450,43 @@ HEADERS = {
                   "Chrome/123.0.0.0 Safari/537.36"
 }
 
-
-
 RETRY_STATUSES = {429, 500, 502, 503, 504}
+
 
 class MaintenanceError(RuntimeError):
     pass
 
+
 def _soup_get(url: str, timeout: int = 20, max_retries: int = 5, backoff_base: float = 0.8) -> BeautifulSoup:
-    """
-    GET s rozumnými hlavičkami, retry a detekcí /maintenance.
-    """
     attempt = 0
     while True:
         attempt += 1
         try:
             r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
-            # Když nás web přesměruje na maintenance, vyhoď speciální výjimku
             if r.url.endswith("/maintenance") or r.status_code == 503:
                 raise MaintenanceError(f"Maintenance mode ({r.status_code}) at {r.url}")
             r.raise_for_status()
             return BeautifulSoup(r.text, "html.parser")
         except (Timeout, ReqConnError) as e:
-            # Síťové potíže -> retry
             if attempt > max_retries:
                 raise
         except HTTPError as e:
             status = getattr(e.response, "status_code", None)
-            # Retry jen pro dočasné kódy
             if status not in RETRY_STATUSES or attempt > max_retries:
                 raise
         except MaintenanceError:
-            # Maintenance: zkusíme chvíli počkat a zkusit znova
             if attempt > max_retries:
                 raise
-        # backoff
         sleep_for = backoff_base * (2 ** (attempt - 1)) + (0.05 * attempt)
         time.sleep(sleep_for)
 
+
 def _after_pipe_product_sections(homepage_url: str = HOMEPAGE):
-    """
-    Vrátí Ordered dict {název: url} pro položky za svislou čárou v hlavní navigaci.
-    Ignoruje Manufacturer / Services / Blog před '|'.
-    """
     soup = _soup_get(homepage_url)
     nav = soup.find("nav", id="main-navigation-menu")
     if not nav:
         raise RuntimeError("Nenalezena hlavní navigace (nav#main-navigation-menu).")
 
-    # Najdi '|' (span.main-navigation-spacer) a vezmi všechny následující <a.nav-link.main-navigation-link>
     spacer = nav.find("span", class_="main-navigation-spacer")
     if not spacer:
         raise RuntimeError("Nenalezen oddělovač '|' v navigaci.")
@@ -561,13 +497,9 @@ def _after_pipe_product_sections(homepage_url: str = HOMEPAGE):
         href = a.get("href")
         if not href or not txt:
             continue
-        # sekce jsou top-level kategorické odkazy (např. /en/switches, /en/router, …)
-        # pro jistotu filtruj na relativně krátké slugy (bez dalších podkategorií v URL)
         try:
             p = urlparse(href)
             path_parts = [x for x in p.path.split("/") if x]
-            # očekáváme něco jako /en/switches nebo /en/router atd. → 2 nebo 3 části
-            # ['en','switches'] == 2 části
             if len(path_parts) == 2 and path_parts[0] == "en":
                 sections[txt] = href
         except Exception:
@@ -578,17 +510,10 @@ def _after_pipe_product_sections(homepage_url: str = HOMEPAGE):
 
     return sections
 
+
 def _iter_listing_pages(section_url: str, start_page: int = 1, max_pages: int | None = None):
-    """
-    Generátor vracející (page_number, soup) pro listing stránky sekce.
-    Končí, když:
-      - nenajde produktový wrapper, nebo
-      - se objeví chybová hláška 'Unfortunately, something went wrong.', nebo
-      - dojde na max_pages (pokud je nastaveno).
-    """
     page = max(1, start_page)
     while True:
-        # přidej / uprav ?p=N v URL
         parsed = urlparse(section_url)
         q = dict(parse_qsl(parsed.query))
         q["p"] = str(page)
@@ -599,11 +524,9 @@ def _iter_listing_pages(section_url: str, start_page: int = 1, max_pages: int | 
             soup = _soup_get(page_url)
         except MaintenanceError as e:
             dbg(f"[MAINTENANCE] {e} – čekám 2 minuty a zkusím to znovu…")
-            time.sleep(120)
-            # po pauze to zkus znova bez zvýšení page counteru
+            time.sleep(6000)
             continue
 
-        # chyba stránky (když přejedeme počet stránek)
         err = soup.select_one("div.alert.alert-danger .alert-content")
         if err and "Unfortunately, something went wrong" in err.get_text(strip=True):
             break
@@ -611,7 +534,6 @@ def _iter_listing_pages(section_url: str, start_page: int = 1, max_pages: int | 
         wrapper = soup.find("div", class_="row cms-listing-row js-listing-wrapper", attrs={"role": "list"})
         items = wrapper.find_all("div", class_="cms-listing-col") if wrapper else []
         if not items:
-            # nic k zobrazení => konec
             break
 
         yield page, soup
@@ -620,11 +542,8 @@ def _iter_listing_pages(section_url: str, start_page: int = 1, max_pages: int | 
         if max_pages is not None and page > max_pages:
             break
 
+
 def _extract_product_links(listing_soup: BeautifulSoup) -> list[str]:
-    """
-    Z listingu vytáhne URL na detail produktu.
-    Hledá <a class="product-name stretched-link" href="...">, fallback na 'Details' tlačítko.
-    """
     urls = []
     wrapper = listing_soup.find("div", class_="row cms-listing-row js-listing-wrapper", attrs={"role": "list"})
     if not wrapper:
@@ -639,15 +558,14 @@ def _extract_product_links(listing_soup: BeautifulSoup) -> list[str]:
             urls.append(a["href"])
     return urls
 
+
 def _normalize_en_url(url: str) -> str:
-    """Jistota, že používáme /en/ (detaily mohou být /de/ → přepneme na /en/)."""
     parsed = urlparse(url)
     path = parsed.path.replace("/de/", "/en/")
     return urlunparse(parsed._replace(path=path))
 
 
 def run_it_market_scraper():
-    # Zeptat se na výstupní formát
     print("Vyber výstupní formát:")
     print("  1) Excel (.xlsx)")
     print("  2) CSV (.csv)")
@@ -655,20 +573,18 @@ def run_it_market_scraper():
 
     if format_choice == "1":
         file_format = "excel"
-        default_file = "product_data.xlsx"
+        default_file = "it-marketData.xlsx"
     else:
         file_format = "csv"
-        default_file = "product_data.csv"
+        default_file = "it-marketData.csv"
 
     output_file = input(f"Zadej název výstupního souboru (enter pro {default_file}): ").strip() or default_file
 
-    # Zkontrolovat příponu souboru
     if file_format == "excel" and not output_file.endswith('.xlsx'):
         output_file += '.xlsx'
     elif file_format == "csv" and not output_file.endswith('.csv'):
         output_file += '.csv'
 
-    # Zbytek parametrů
     headless = input("Headless režim? (ano/ne, enter pro ano): ").strip().lower() != "ne"
 
     delay_input = input("Zadej zpoždění mezi požadavky v sekundách (enter pro 0.5): ").strip()
@@ -676,6 +592,9 @@ def run_it_market_scraper():
 
     max_pages_input = input("Maximální počet stránek na sekci (enter pro všechny): ").strip()
     max_pages_per_section = int(max_pages_input) if max_pages_input else None
+
+    threads_input = input("Počet paralelních vláken (enter pro 5): ").strip()
+    num_threads = int(threads_input) if threads_input else 5
 
     print("[it-market] Čtu sekce z hlavní stránky…")
     sections = _after_pipe_product_sections(HOMEPAGE)
@@ -707,7 +626,6 @@ def run_it_market_scraper():
             picked = [matching[0]]
         picked_mode = "single"
 
-    # Dotaz na start mód
     progress = _load_progress() if picked_mode == "all" else None
     resume = None
 
@@ -745,64 +663,74 @@ def run_it_market_scraper():
             _clear_progress()
 
     seen_urls = set()
+    output_path = _resolve_output_path(output_file)
 
-    for sec_name in picked:
-        sec_url = sections[sec_name]
-        print(f"\n=== Sekce: {sec_name} → {sec_url} ===")
-        total_products = 0
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        for sec_name in picked:
+            sec_url = sections[sec_name]
+            print(f"\n=== Sekce: {sec_name} → {sec_url} ===")
+            total_products = 0
 
-        # Nastav startovací bod pro aktuální sekci
-        start_page = 1
-        start_product_idx = 1
-        if resume and resume.get("section") == sec_name:
-            start_page = max(1, int(resume.get("page", 1)))
-            start_product_idx = max(1, int(resume.get("product_idx_on_page", 1)))
-
-        page_iter = _iter_listing_pages(sec_url, start_page=start_page, max_pages=max_pages_per_section)
-
-        for page_num, soup in page_iter:
-            print(f"[{sec_name}] Stránka {page_num}…")
-            product_links = _extract_product_links(soup)
-            if not product_links:
-                print(f"[{sec_name}] Na stránce {page_num} nejsou žádné produkty → končím sekci.")
-                break
-
-            # Pokud navazujeme uprostřed stránky, přeskoč prvních N-1 produktů
-            first_idx = start_product_idx if page_num == start_page else 1
-
-            for idx_on_page, link in enumerate(product_links, start=1):
-                if idx_on_page < first_idx:
-                    continue
-
-                url = _normalize_en_url(link)
-                if url in seen_urls:
-                    continue
-                seen_urls.add(url)
-
-                print(f"  → stránka: {page_num}")
-                print(f"  → produkt: {idx_on_page}/24")
-                print(f"  → url: {url}")
-                try:
-                    scrape_product_data(url, output_file=output_file, file_format=file_format, headless=headless)
-                except Exception as e:
-                    print(f"    ! chyba při zpracování produktu: {e}")
-
-                # Ukládej progress po každém produktu
-                _save_progress(sec_name, page_num, idx_on_page, url)
-
-                total_products += 1
-                if delay_between_requests:
-                    time.sleep(delay_between_requests)
-
-            # po první stránce už nepokračujeme „od prostředka“
+            start_page = 1
             start_product_idx = 1
+            if resume and resume.get("section") == sec_name:
+                start_page = max(1, int(resume.get("page", 1)))
+                start_product_idx = max(1, int(resume.get("product_idx_on_page", 1)))
 
-        print(f"[{sec_name}] Hotovo. Zpracováno produktů: {total_products}")
+            page_iter = _iter_listing_pages(sec_url, start_page=start_page, max_pages=max_pages_per_section)
+            future_to_url = {}
+
+            for page_num, soup in page_iter:
+                print(f"[{sec_name}] Stránka {page_num}…")
+                product_links = _extract_product_links(soup)
+                if not product_links:
+                    print(f"[{sec_name}] Na stránce {page_num} nejsou žádné produkty → končím sekci.")
+                    break
+
+                first_idx = start_product_idx if page_num == start_page else 1
+
+                for idx_on_page, link in enumerate(product_links, start=1):
+                    if idx_on_page < first_idx:
+                        continue
+
+                    url = _normalize_en_url(link)
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+
+                    print(f"  → stránka: {page_num}")
+                    print(f"  → produkt: {idx_on_page}/24")
+                    print(f"  → url: {url}")
+
+                    future = executor.submit(
+                        scrape_product_data,
+                        url,
+                        output_file,
+                        file_format,
+                        headless
+                    )
+                    future_to_url[future] = (sec_name, page_num, idx_on_page, url)
+
+                for future in as_completed(future_to_url):
+                    sec_name, page_num, idx_on_page, url = future_to_url[future]
+                    try:
+                        rows, processed_url = future.result()
+                        save_data_batch(rows, output_path, file_format)
+
+                        with progress_lock:
+                            _save_progress(sec_name, page_num, idx_on_page, url)
+
+                        total_products += 1
+                        print(f"  ✓ Hotovo: {url}")
+                    except Exception as e:
+                        print(f"    ! chyba při zpracování produktu {url}: {e}")
+
+                    del future_to_url[future]
+
+                start_product_idx = 1
+
+            print(f"[{sec_name}] Hotovo. Zpracováno produktů: {total_products}")
 
 
 if __name__ == "__main__":
-    # Příklad běhu nadstavby:
-    # - nechá tě vybrat sekci nebo 'vše'
-    # - zapisuje do product_data.xlsx
-    # - product detaily se otevírají v headless Chromu
     run_it_market_scraper()
