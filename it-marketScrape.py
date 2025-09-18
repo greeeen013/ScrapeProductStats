@@ -282,7 +282,8 @@ def extract_variant_data(driver):
                 categories.append(crumb.find_element(By.CLASS_NAME, 'breadcrumb-title').text.strip())
             except Exception:
                 continue
-        data['category_path'] = ' > '.join([c for c in categories if c])
+        category_path = ' > '.join([c for c in categories if c])
+        data['category_path'] = category_path if category_path else 'N/A'
     except NoSuchElementException:
         data['category_path'] = 'N/A'
 
@@ -291,7 +292,7 @@ def extract_variant_data(driver):
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-PROGRESS_FILE = SCRIPT_DIR / "posledni_zpracovanej_produkt.json"
+PROGRESS_FILE = SCRIPT_DIR / "it-marketScrapeLastProduct.json"
 
 
 def _save_progress(section: str, page: int, product_idx_on_page: int, url: str):
