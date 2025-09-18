@@ -23,7 +23,7 @@ def smicro_scrape_product_page():
         if page == 0:
             url = base_url
         else:
-            url = f"{base_url}?page={page}"
+            url = f"{base_url}&page={page}"
 
         print(f"Scrapuji stránku: {page + 1}")
 
@@ -237,7 +237,23 @@ def init_csv_and_get_last_index(filename):
             return 1
 
 def save_to_csv(filename, index, product_data):
-    """Uložení dat produktu do CSV"""
+    """Uložení dat produktu do CSV s kontrolou duplicit"""
+    # Načtení existujících dat
+    existing_data = set()
+    if os.path.exists(filename):
+        with open(filename, 'r', newline='', encoding='utf-8') as file:
+            reader = csv.reader(file, delimiter=';')
+            next(reader)  # Přeskočit hlavičku
+            for row in reader:
+                if len(row) > 2:  # Kontrola, zda řádek obsahuje part_number
+                    existing_data.add(row[2])  # part_number je ve 3. sloupci
+
+    # Pokud part_number už existuje, přeskočit zápis
+    if product_data.get('part_number') in existing_data:
+        print(f"Přeskakuji duplicitní produkt: {product_data.get('part_number')}")
+        return
+
+    # Zápis nového záznamu
     with open(filename, 'a', newline='', encoding='utf-8') as file:
         writer = csv.writer(file, delimiter=';')
         writer.writerow([
@@ -253,6 +269,6 @@ def save_to_csv(filename, index, product_data):
 
 
 if __name__ == "__main__":
-    #smicro_scrape_product_page()
+    smicro_scrape_product_page()
     csv_filename = 'smicro_products.csv'
     convert_csv_to_excel(csv_filename)
