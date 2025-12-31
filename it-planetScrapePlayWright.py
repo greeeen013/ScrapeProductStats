@@ -43,7 +43,7 @@ class CsvWriter:
         self.filepath = Path(filepath)
         if not self.filepath.exists():
             with open(self.filepath, 'w', newline='', encoding='utf-8-sig') as f:
-                writer = csv.writer(f, delimiter=',', quoting=csv.QUOTE_ALL)
+                writer = csv.writer(f, delimiter=';', quoting=csv.QUOTE_ALL)
                 writer.writerow([
                     'Product Name', 'Condition', 'Price', 'Delivery Time',
                     'Supplier Number', 'Product ID (SKU)', 'Images',
@@ -53,7 +53,7 @@ class CsvWriter:
     def write(self, rows):
         if not rows: return
         with open(self.filepath, 'a', newline='', encoding='utf-8-sig') as f:
-            writer = csv.writer(f, delimiter=',', quoting=csv.QUOTE_ALL)
+            writer = csv.writer(f, delimiter=';', quoting=csv.QUOTE_ALL)
             for row in rows:
                 cleaned_row = [str(item) if item is not None else "N/A" for item in row]
                 writer.writerow(cleaned_row)
@@ -338,7 +338,7 @@ async def get_listing_urls(page: Page, section_url, page_num):
 async def main():
     print("=== IT-Planet Scraper (V6 - Images Fixed) ===")
 
-    out_name = "it_planet_data.csv"
+    out_name = "it-planet_data.csv"
 
     w_input = input("Počet paralelních oken (doporučeno 3-5) [3]: ").strip()
     max_concurrent = int(w_input) if w_input.isdigit() else 3
