@@ -1,6 +1,33 @@
+import socket
+import subprocess
 import requests
 
 TARGET = "https://it-market.com/en"
+FALLBACK_DNS = "8.8.8.8"
+
+# Patch DNS — pokud Tailscale MagicDNS selže na externí doméně,
+# zkusí fallback přes 8.8.8.8 (Google DNS)
+_orig_getaddrinfo = socket.getaddrinfo
+
+def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    try:
+        return _orig_getaddrinfo(host, port, family, type, proto, flags)
+    except socket.gaierror:
+        try:
+            result = subprocess.run(
+                ["nslookup", host, FALLBACK_DNS],
+                capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.splitlines():
+                if "Address:" in line and FALLBACK_DNS not in line:
+                    ip = line.split("Address:")[-1].strip()
+                    if ip and ":" not in ip:  # preferuj IPv4
+                        return _orig_getaddrinfo(ip, port, family, type, proto, flags)
+        except Exception:
+            pass
+        raise
+
+socket.getaddrinfo = _patched_getaddrinfo
 
 def get_public_ip_and_geo():
     """Zjistí veřejnou IP a geolokaci přes ip-api.com (zdarma, bez API klíče)."""
