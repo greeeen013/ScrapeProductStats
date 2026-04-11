@@ -328,6 +328,16 @@ async def get_listing_urls(page: Page, section_url, page_num):
 
     dbg(f"Načteno: {page.url}")
 
+    # Diagnostika: co je na stránce
+    title = await page.title()
+    dbg(f"Titulek stránky: {title}")
+    all_anchors = await page.locator('a').all()
+    dbg(f"Celkem <a> elementů: {len(all_anchors)}")
+    for a in all_anchors[:8]:
+        href = await a.get_attribute('href') or ''
+        txt = (await a.inner_text()).strip().replace('\n', ' ')[:60]
+        dbg(f"  link: {href!r} | text: {txt!r}")
+
     alert = page.locator("div.alert.alert-danger .alert-content")
     if await alert.count() > 0:
         txt = await alert.inner_text()
