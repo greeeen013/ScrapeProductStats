@@ -448,18 +448,61 @@ async def get_listing_urls(page: Page, section_url, page_num):
         return []
 
 
+async def test_proxy(proxy_url: str) -> bool:
+    """Otestuje dostupnost SOCKS5 proxy jednoduchým TCP spojením."""
+    import socket
+    try:
+        host, port = proxy_url.replace("socks5://", "").split(":")
+        s = socket.create_connection((host, int(port)), timeout=3)
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
 # === MAIN ===
 async def main():
-    print("=== IT-Planet Scraper (V6 - Images Fixed) ===")
+    print("=== IT-Planet Scraper ===")
 
     out_name = "it-planet_data.csv"
 
     w_input = input("Počet paralelních oken (doporučeno 3-5) [3]: ").strip()
     max_concurrent = int(w_input) if w_input.isdigit() else 3
 
+    headless_input = input("Headless režim? (ano/ne, enter=ano): ").strip().lower()
+    headless = headless_input != "ne"
+
+    PROXY_URL = "socks5://127.0.0.1:40000"
+    proxy_ok = await test_proxy(PROXY_URL)
+    if proxy_ok:
+        print(f"Proxy {PROXY_URL} dostupná – používám.")
+        proxy_cfg = {"server": PROXY_URL}
+    else:
+        print(f"Proxy {PROXY_URL} nedostupna - pripojuji primo.")
+        proxy_cfg = None
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, proxy={"server": "socks5://127.0.0.1:40000"})
-        context = await browser.new_context(viewport={"width": 1600, "height": 1000})
+        launch_kwargs = dict(
+            headless=headless,
+            args=[
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        if proxy_cfg:
+            launch_kwargs["proxy"] = proxy_cfg
+
+        browser = await p.chromium.launch(**launch_kwargs)
+        context = await browser.new_context(
+            viewport={"width": 1600, "height": 1000},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            },
+        )
 
         try:
             sections = await get_sections(context)

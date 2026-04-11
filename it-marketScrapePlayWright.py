@@ -644,11 +644,22 @@ class DataWriter:
                 writer.writerows(rows)
 
 
+async def test_proxy(proxy_url: str) -> bool:
+    """Otestuje dostupnost SOCKS5 proxy jednoduchým TCP spojením."""
+    import socket
+    try:
+        host, port = proxy_url.replace("socks5://", "").split(":")
+        s = socket.create_connection((host, int(port)), timeout=3)
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
 # === HLAVNÍ FUNKCE ===
 async def main():
     print("=== IT-Market Scraper (Playwright) ===")
 
-    # === ZMĚNA: Hardcoded nastavení pro CSV, uvozovky a název souboru ===
     file_format = "csv"
     out_name = "it-market.csv"
     print(f"Výstup nastaven na: {out_name} (Formát: {file_format}, oddělovač: ';', uvozovky: vše)")
@@ -661,8 +672,17 @@ async def main():
     max_pages_input = input("Max stránek na sekci (enter=vše): ").strip()
     max_pages = int(max_pages_input) if max_pages_input.isdigit() else None
 
+    PROXY_URL = "socks5://127.0.0.1:40000"
+    proxy_ok = await test_proxy(PROXY_URL)
+    if proxy_ok:
+        print(f"Proxy {PROXY_URL} dostupná – používám.")
+        proxy_cfg = {"server": PROXY_URL}
+    else:
+        print(f"Proxy {PROXY_URL} nedostupna - pripojuji primo.")
+        proxy_cfg = None
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
+        launch_kwargs = dict(
             headless=headless,
             args=[
                 "--disable-gpu",
@@ -670,8 +690,11 @@ async def main():
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
             ],
-            proxy={"server": "socks5://127.0.0.1:40000"}
         )
+        if proxy_cfg:
+            launch_kwargs["proxy"] = proxy_cfg
+
+        browser = await p.chromium.launch(**launch_kwargs)
         context = await browser.new_context(
             viewport={"width": 1600, "height": 1200},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
