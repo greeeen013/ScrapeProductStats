@@ -1,14 +1,21 @@
 import asyncio
 import csv
+import io
 import json
 import re
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
 
 from playwright.async_api import async_playwright, Page
+
+# UTF-8 výstup – oprava pro Windows terminál (cp1252 neumí česky)
+if hasattr(sys.stdout, 'buffer') and sys.stdout.encoding.lower().replace('-', '') not in ('utf8', 'utf8sig'):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 import openpyxl
 from openpyxl import Workbook

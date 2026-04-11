@@ -1,7 +1,9 @@
 import asyncio
 import csv
+import io
 import json
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,12 +11,31 @@ from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl, urljoin
 
 from playwright.async_api import async_playwright, Page
 
+# UTF-8 výstup – oprava pro Windows terminál (cp1252 neumí česky)
+if hasattr(sys.stdout, 'buffer') and sys.stdout.encoding.lower().replace('-', '') not in ('utf8', 'utf8sig'):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 # === KONFIGURACE ===
 BASE_URL = "https://it-planet.com"
 START_URL = "https://it-planet.com/en"
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROGRESS_FILE = SCRIPT_DIR / "it-planet_progress_v6.json"
 HTML_DUMP_DIR = SCRIPT_DIR / "html_dumps"
+
+STEALTH_JS = """
+() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+    window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+    const orig = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) =>
+        parameters.name === 'notifications'
+            ? Promise.resolve({ state: Notification.permission })
+            : orig(parameters);
+}
+"""
 
 
 # === POMOCNÉ FUNKCE ===
@@ -70,7 +91,11 @@ def clean_text(text):
 def parse_price(text):
     if not text or "request" in text.lower() or "anfrage" in text.lower():
         return "On Request"
-    return text.replace('€', '').replace('*', '').strip()
+    cleaned = text.replace('€', '').replace('*', '').strip()
+    # Shopware placeholder pro "On Request" cenu
+    if cleaned == "9999999" or cleaned.startswith("9999999"):
+        return "On Request"
+    return cleaned
 
 
 # === UKLÁDÁNÍ DO CSV ===
@@ -124,7 +149,8 @@ async def extract_current_variant_data(page: Page, base_data: dict):
         else:
             meta = page.locator('meta[itemprop="price"]')
             if await meta.count() > 0:
-                data['price'] = clean_text(await meta.get_attribute("content"))
+                meta_val = await meta.get_attribute("content") or ""
+                data['price'] = parse_price(meta_val)
             else:
                 data['price'] = "On Request"
     except:
@@ -179,8 +205,12 @@ async def extract_current_variant_data(page: Page, base_data: dict):
                     else:
                         url = await img_tag.get_attribute('src')
 
-            if url and url not in srcs:
-                srcs.append(url)
+            if url:
+                # Relativní URL doplníme na absolutní
+                if url.startswith('/'):
+                    url = BASE_URL + url
+                if url not in srcs:
+                    srcs.append(url)
 
         data['images'] = ' | '.join(srcs) if srcs else "N/A"
     except Exception as e:
@@ -405,7 +435,6 @@ async def get_listing_urls(page: Page, section_url, page_num):
             await page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
         except Exception as e:
             dbg(f"Listing load warning (pokračuji): {e}")
-        await page.wait_for_timeout(1500)
 
         if await check_cloudflare(page):
             await dump_page_html(page, f"cloudflare_listing_p{page_num}")
@@ -415,11 +444,21 @@ async def get_listing_urls(page: Page, section_url, page_num):
         title = await page.title()
         dbg(f"  Titulek: {title}")
 
-        # Prázdná stránka – konec sekce
-        if await page.locator(".alert.is--info").count() > 0:
+        # Počkej na produkty – JS je renderuje asynchronně po DOMContentLoaded
+        try:
+            await page.wait_for_selector(".product--box", timeout=15000)
+        except Exception:
+            pass  # timeout = žádné produkty (konec sekce)
+
+        box_count = await page.locator(".product--box").count()
+        dbg(f"  product--box count: {box_count}")
+
+        # Prázdná stránka – konec sekce (ignorujeme skryté alerty)
+        if await page.locator(".alert.is--info:not(.is--hidden)").count() > 0:
             return []
-        if await page.locator(".product--box").count() == 0:
-            dbg("  Žádné product--box elementy, konec sekce")
+        if box_count == 0:
+            dbg("  Zadne product--box elementy, konec sekce")
+            await dump_page_html(page, f"empty_listing_p{page_num}")
             return []
 
         links = []
@@ -436,7 +475,7 @@ async def get_listing_urls(page: Page, section_url, page_num):
                 if href:
                     links.append(href)
 
-        dbg(f"  Nalezeno produktů: {len(set(links))}")
+        dbg(f"  Nalezenych produktu: {len(set(links))}")
         return list(set(links))
 
     except Exception as e:
@@ -503,6 +542,7 @@ async def main():
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             },
         )
+        await context.add_init_script(STEALTH_JS)
 
         try:
             sections = await get_sections(context)
