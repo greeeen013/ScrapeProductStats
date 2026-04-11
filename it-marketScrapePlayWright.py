@@ -38,12 +38,48 @@ STEALTH_JS = """
 HOMEPAGE = "https://it-market.com/en"
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROGRESS_FILE = SCRIPT_DIR / "it-marketScrapeLastProduct.json"
+HTML_DUMP_DIR = SCRIPT_DIR / "html_dumps"
 
 
 # === POMOCNÉ FUNKCE PRO LOGOVÁNÍ ===
 def dbg(msg):
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] {msg}")
+
+
+async def dump_page_html(page, label: str):
+    """Uloží HTML stránky do souboru pro debug."""
+    try:
+        HTML_DUMP_DIR.mkdir(exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        safe_label = re.sub(r'[^a-zA-Z0-9_-]', '_', label)[:60]
+        path = HTML_DUMP_DIR / f"{ts}_{safe_label}.html"
+        html = await page.content()
+        path.write_text(html, encoding="utf-8")
+        dbg(f"HTML dump uložen: {path}")
+    except Exception as e:
+        dbg(f"Nepodařilo se uložit HTML dump: {e}")
+
+
+async def check_cloudflare(page) -> bool:
+    """Vrátí True pokud je stránka blokována Cloudflare challenge."""
+    try:
+        title = await page.title()
+        html_snippet = await page.evaluate("() => document.body ? document.body.innerHTML.slice(0, 4000) : ''")
+        signals = [
+            "just a moment" in title.lower(),
+            "cf-browser-verification" in html_snippet,
+            "checking your browser" in html_snippet.lower(),
+            "challenge-platform" in html_snippet,
+            "ray id" in html_snippet.lower() and "cloudflare" in html_snippet.lower(),
+            "enable javascript and cookies" in html_snippet.lower(),
+        ]
+        if any(signals):
+            dbg(f"CLOUDFLARE DETEKOVÁN: title={title!r}, url={page.url}")
+            return True
+    except Exception:
+        pass
+    return False
 
 
 # === SPRÁVA PROGRESSU ===
@@ -177,14 +213,35 @@ async def extract_variant_data(page: Page, base_data: dict):
                 data['stock_status'] = 'N/A'
         else:
             data.update(
-                {'condition': 'Check Description', 'price': 'Check Site', 'net_price': 'N/A', 'stock_status': 'N/A'})
+                {'condition': 'Check Description', 'price': 'N/A', 'net_price': 'N/A', 'stock_status': 'N/A'})
 
-            price_wrapper = page.locator('.product-detail-price-container').first
-            if await price_wrapper.count() > 0:
-                raw_p = await price_wrapper.inner_text()
+            # Zkus cenu z prvního konfiguračního labelu (i pro single-option produkty)
+            price_block = page.locator('.product-detail-configurator-option-label-prices').first
+            if await price_block.count() > 0:
+                raw_p = await price_block.inner_text()
                 p, np = parse_price_block(raw_p)
                 data['price'] = p
                 data['net_price'] = np
+            else:
+                # Záloha: cena z JSON-LD structured data (schema.org)
+                try:
+                    price_val = await page.evaluate("""() => {
+                        const el = document.querySelector('[itemprop="price"]');
+                        if (el) return el.getAttribute('content') || el.innerText;
+                        const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+                        for (const s of scripts) {
+                            try {
+                                const d = JSON.parse(s.textContent);
+                                const offers = d.offers || (d['@graph'] || []).flatMap(x => x.offers || []);
+                                if (offers && offers.length) return offers[0].price + ' ' + (offers[0].priceCurrency || '');
+                            } catch(e) {}
+                        }
+                        return null;
+                    }""")
+                    if price_val:
+                        data['price'] = str(price_val).strip()
+                except Exception:
+                    pass
 
     except Exception as e:
         dbg(f"Chyba detailů varianty: {e}")
@@ -239,6 +296,7 @@ async def scrape_product(context, url, semaphore):
 
             dbg(f"Otevírám: {url}")
             await page.goto(url, timeout=90000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(1500)
 
             try:
                 await page.add_style_tag(
@@ -247,6 +305,10 @@ async def scrape_product(context, url, semaphore):
                     "() => { const el = document.getElementById('usercentrics-root'); if (el) el.remove(); }")
             except Exception:
                 pass
+
+            if await check_cloudflare(page):
+                await dump_page_html(page, f"cloudflare_{url.split('/')[-1]}")
+                raise RuntimeError("Cloudflare challenge – stránka zablokována")
 
             if "maintenance" in page.url or await page.locator("text=Maintenance mode").count() > 0:
                 raise RuntimeError("Maintenance Mode")
@@ -329,10 +391,20 @@ async def scrape_product(context, url, semaphore):
             return final_rows, url
 
         except Exception as e:
-            dbg(f"Chyba při zpracování {url}: {e}")
+            dbg(f"CHYBA při zpracování {url}: {e}")
+            try:
+                if not page.is_closed():
+                    is_cf = await check_cloudflare(page)
+                    label = f"{'cloudflare' if is_cf else 'error'}_{url.split('/')[-1]}"
+                    await dump_page_html(page, label)
+            except Exception:
+                pass
             return [], url
         finally:
-            await page.close()
+            try:
+                await page.close()
+            except Exception:
+                pass
 
 
 async def get_listing_urls(page: Page, section_url, page_num):
@@ -343,31 +415,31 @@ async def get_listing_urls(page: Page, section_url, page_num):
     target_url = urlunparse(parsed._replace(query=new_q))
 
     dbg(f"Listing URL: {target_url}")
-    await page.goto(target_url, timeout=60000, wait_until="networkidle")
-    # Extra čekání pro případ Cloudflare challenge (JS challenge potřebuje čas)
+    try:
+        await page.goto(target_url, timeout=60000, wait_until="networkidle")
+    except Exception as e:
+        dbg(f"Listing load warning (pokračuji): {e}")
     await page.wait_for_timeout(2000)
 
     dbg(f"Načteno: {page.url}")
 
-    # Diagnostika: co je na stránce
+    if await check_cloudflare(page):
+        await dump_page_html(page, f"cloudflare_listing_p{page_num}")
+        dbg("FATAL: Listing stránka blokována Cloudflare")
+        return []
+
     title = await page.title()
     dbg(f"Titulek stránky: {title}")
-    all_anchors = await page.locator('a').all()
-    dbg(f"Celkem <a> elementů: {len(all_anchors)}")
-    for a in all_anchors[:8]:
-        href = await a.get_attribute('href') or ''
-        txt = (await a.inner_text()).strip().replace('\n', ' ')[:60]
-        dbg(f"  link: {href!r} | text: {txt!r}")
 
     alert = page.locator("div.alert.alert-danger .alert-content")
     if await alert.count() > 0:
         txt = await alert.inner_text()
         if "Unfortunately, something went wrong" in txt:
+            dbg(f"Shopware chyba na listing stránce: {txt[:100]}")
             return []
 
-    # Diagnostika: kolik linek /en/ je celkem na stránce?
     total_en_links = await page.locator('a[href*="/en/"]').count()
-    dbg(f"Celkem /en/ linků na stránce: {total_en_links}")
+    dbg(f"Celkem /en/ linků: {total_en_links}")
 
     links = set()
 
@@ -432,8 +504,30 @@ async def get_sections(context):
     EXCLUDE_PATHS = {'manufacturer-list', 'service', 'it-remarketing', 'blog', 'search', 'account', 'checkout', 'cart', 'wishlist'}
 
     page = await context.new_page()
-    await page.goto(HOMEPAGE, wait_until="networkidle", timeout=60000)
+    try:
+        await page.goto(HOMEPAGE, wait_until="domcontentloaded", timeout=60000)
+    except Exception as e:
+        dbg(f"Homepage load warning (pokračuji): {e}")
     await page.wait_for_timeout(2000)
+
+    if await check_cloudflare(page):
+        await dump_page_html(page, "cloudflare_homepage")
+        dbg("FATAL: Homepage blokována Cloudflare – nelze načíst sekce, používám zálohu")
+        await page.close()
+        EXCLUDE_PATHS = set()  # bude přepsán níže, jen aby nedošlo k NameError
+        sections = {}
+        known = [
+            ("Switches",         f"{HOMEPAGE.rstrip('/')}/switches"),
+            ("Router",           f"{HOMEPAGE.rstrip('/')}/router"),
+            ("Communication",    f"{HOMEPAGE.rstrip('/')}/communication"),
+            ("Servers",          f"{HOMEPAGE.rstrip('/')}/servers"),
+            ("Security",         f"{HOMEPAGE.rstrip('/')}/security"),
+            ("Storage & Memory", f"{HOMEPAGE.rstrip('/')}/storage-memory"),
+            ("Components",       f"{HOMEPAGE.rstrip('/')}/components"),
+        ]
+        for name, url in known:
+            sections[name] = url
+        return sections
 
     sections = {}
 
