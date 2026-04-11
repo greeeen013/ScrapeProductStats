@@ -13,6 +13,27 @@ from playwright.async_api import async_playwright, Page
 import openpyxl
 from openpyxl import Workbook
 
+try:
+    from playwright_stealth import stealth_async
+    STEALTH_AVAILABLE = True
+except ImportError:
+    STEALTH_AVAILABLE = False
+
+# Manuální stealth init script (záloha pokud playwright-stealth není nainstalován)
+STEALTH_JS = """
+() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+    window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+    const orig = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) =>
+        parameters.name === 'notifications'
+            ? Promise.resolve({ state: Notification.permission })
+            : orig(parameters);
+}
+"""
+
 # === KONFIGURACE ===
 HOMEPAGE = "https://it-market.com/en"
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -322,9 +343,9 @@ async def get_listing_urls(page: Page, section_url, page_num):
     target_url = urlunparse(parsed._replace(query=new_q))
 
     dbg(f"Listing URL: {target_url}")
-    await page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
-    # Krátký wait pro dynamický obsah
-    await page.wait_for_timeout(1500)
+    await page.goto(target_url, timeout=60000, wait_until="networkidle")
+    # Extra čekání pro případ Cloudflare challenge (JS challenge potřebuje čas)
+    await page.wait_for_timeout(2000)
 
     dbg(f"Načteno: {page.url}")
 
@@ -411,7 +432,8 @@ async def get_sections(context):
     EXCLUDE_PATHS = {'manufacturer-list', 'service', 'it-remarketing', 'blog', 'search', 'account', 'checkout', 'cart', 'wishlist'}
 
     page = await context.new_page()
-    await page.goto(HOMEPAGE, wait_until="domcontentloaded", timeout=30000)
+    await page.goto(HOMEPAGE, wait_until="networkidle", timeout=60000)
+    await page.wait_for_timeout(2000)
 
     sections = {}
 
@@ -546,8 +568,31 @@ async def main():
     max_pages = int(max_pages_input) if max_pages_input.isdigit() else None
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless, args=["--disable-gpu"], proxy={"server": "socks5://127.0.0.1:40000"})
-        context = await browser.new_context(viewport={"width": 1600, "height": 1200})
+        browser = await p.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+            proxy={"server": "socks5://127.0.0.1:40000"}
+        )
+        context = await browser.new_context(
+            viewport={"width": 1600, "height": 1200},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            },
+            java_script_enabled=True,
+        )
+        # Stealth: schovej webdriver příznak
+        await context.add_init_script(STEALTH_JS)
+        if STEALTH_AVAILABLE:
+            dbg("playwright-stealth k dispozici, aplikuji na kontext")
+        else:
+            dbg("playwright-stealth není nainstalován, používám manuální stealth")
 
         print("Načítám sekce...")
         try:
