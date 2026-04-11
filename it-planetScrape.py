@@ -27,6 +27,8 @@ import platform
 import shutil
 from requests.exceptions import HTTPError, Timeout, ConnectionError as ReqConnError
 
+WARP_PROXY = {"http": "socks5h://127.0.0.1:40000", "https": "socks5h://127.0.0.1:40000"}
+
 
 def dbg(msg):
     ts = time.strftime("%H:%M:%S")
@@ -57,6 +59,7 @@ def chrome_driver(headless=True,
     opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--window-size=1400,1600")
+    opts.add_argument("--proxy-server=socks5://127.0.0.1:40000")
 
     if bc == "chromium":
         if binary_override:
@@ -149,7 +152,7 @@ def _soup_get(url: str, timeout: int = 20, max_retries: int = 5, backoff_base: f
     while True:
         attempt += 1
         try:
-            r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+            r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True, proxies=WARP_PROXY)
             if r.url.endswith("/maintenance") or r.status_code == 503:
                 raise MaintenanceError(f"Maintenance mode ({r.status_code}) at {r.url}")
             r.raise_for_status()

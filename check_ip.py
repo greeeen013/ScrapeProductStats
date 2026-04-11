@@ -2,6 +2,8 @@ import socket
 import subprocess
 import requests
 
+WARP_PROXY = {"http": "socks5h://127.0.0.1:40000", "https": "socks5h://127.0.0.1:40000"}
+
 TARGET = "https://it-market.com/en"
 FALLBACK_DNS = "8.8.8.8"
 
@@ -31,12 +33,12 @@ socket.getaddrinfo = _patched_getaddrinfo
 
 def get_public_ip_and_geo():
     """Zjistí veřejnou IP a geolokaci přes ip-api.com (zdarma, bez API klíče)."""
-    r = requests.get("http://ip-api.com/json/?fields=query,country,regionName,city,isp,org,as", timeout=10)
+    r = requests.get("http://ip-api.com/json/?fields=query,country,regionName,city,isp,org,as", timeout=10, proxies=WARP_PROXY)
     return r.json()
 
 def get_cloudflare_trace():
     """Cloudflare trace — ukáže IP + jestli je WARP zapnutý."""
-    r = requests.get("https://www.cloudflare.com/cdn-cgi/trace", timeout=10)
+    r = requests.get("https://www.cloudflare.com/cdn-cgi/trace", timeout=10, proxies=WARP_PROXY)
     data = {}
     for line in r.text.strip().splitlines():
         if "=" in line:
@@ -46,7 +48,7 @@ def get_cloudflare_trace():
 
 def ping_target(url):
     """Pošle GET request na cílovou stránku a vrátí status."""
-    r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+    r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"}, proxies=WARP_PROXY)
     return r.status_code, r.url
 
 print("=" * 55)
