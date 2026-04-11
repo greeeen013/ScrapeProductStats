@@ -350,19 +350,79 @@ async def get_listing_urls(page: Page, section_url, page_num):
 
 
 async def get_sections(context):
-    page = await context.new_page()
-    await page.goto(HOMEPAGE)
+    # Cesty, které nejsou produktové sekce (výrobci, servis, blog, atd.)
+    EXCLUDE_PATHS = {'manufacturer-list', 'service', 'it-remarketing', 'blog', 'search', 'account', 'checkout', 'cart', 'wishlist'}
 
-    nav = page.locator("#main-navigation-menu")
-    spacer = nav.locator("span.main-navigation-spacer")
-    links = await spacer.locator("xpath=following-sibling::a[contains(@class, 'main-navigation-link')]").all()
+    page = await context.new_page()
+    await page.goto(HOMEPAGE, wait_until="domcontentloaded", timeout=30000)
 
     sections = {}
-    for link in links:
-        txt = (await link.inner_text()).strip()
-        href = await link.get_attribute("href")
-        if txt and href and '/en/' in href:
-            sections[txt] = href
+
+    # Strategie 1: původní selektory (pro případ, že by se web vrátil ke starému layoutu)
+    try:
+        nav = page.locator("#main-navigation-menu")
+        if await nav.count() > 0:
+            spacer = nav.locator("span.main-navigation-spacer")
+            if await spacer.count() > 0:
+                links = await spacer.locator("xpath=following-sibling::a[contains(@class, 'main-navigation-link')]").all()
+                for link in links:
+                    txt = (await link.inner_text()).strip()
+                    href = await link.get_attribute("href")
+                    if txt and href and '/en/' in href:
+                        sections[txt] = href
+    except Exception:
+        pass
+
+    # Strategie 2: jakékoliv .main-navigation-link v navigaci
+    if not sections:
+        try:
+            links = await page.locator("a.main-navigation-link").all()
+            for link in links:
+                txt = (await link.inner_text()).strip()
+                href = await link.get_attribute("href")
+                if not (txt and href and '/en/' in href):
+                    continue
+                path = href.rstrip('/').split('/en/')[-1]
+                if '/' in path or path in EXCLUDE_PATHS:
+                    continue
+                sections[txt] = href
+        except Exception:
+            pass
+
+    # Strategie 3: všechny nav/header odkazy na top-level /en/ cesty
+    if not sections:
+        try:
+            for selector in ["nav a", "header a", ".navigation a", "#navigation a"]:
+                links = await page.locator(selector).all()
+                for link in links:
+                    txt = (await link.inner_text()).strip()
+                    href = await link.get_attribute("href")
+                    if not (txt and href and '/en/' in href):
+                        continue
+                    # Pouze top-level cesty (/en/switches ano, /en/switches/gigabit ne)
+                    path = href.rstrip('/').split('/en/')[-1]
+                    if not path or '/' in path or path in EXCLUDE_PATHS:
+                        continue
+                    sections[txt] = href
+                if sections:
+                    break
+        except Exception:
+            pass
+
+    # Strategie 4: záložní - known sekce z webu
+    if not sections:
+        dbg("Nepodařilo se načíst sekce dynamicky, používám záložní seznam.")
+        known = [
+            ("Switches",        f"{HOMEPAGE.rstrip('/')}/switches"),
+            ("Router",          f"{HOMEPAGE.rstrip('/')}/router"),
+            ("Communication",   f"{HOMEPAGE.rstrip('/')}/communication"),
+            ("Servers",         f"{HOMEPAGE.rstrip('/')}/servers"),
+            ("Security",        f"{HOMEPAGE.rstrip('/')}/security"),
+            ("Storage & Memory",f"{HOMEPAGE.rstrip('/')}/storage-memory"),
+            ("Components",      f"{HOMEPAGE.rstrip('/')}/components"),
+        ]
+        for name, url in known:
+            sections[name] = url
 
     await page.close()
     return sections
