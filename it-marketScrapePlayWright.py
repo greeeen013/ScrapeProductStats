@@ -321,7 +321,12 @@ async def get_listing_urls(page: Page, section_url, page_num):
     new_q = urlencode(q, doseq=True)
     target_url = urlunparse(parsed._replace(query=new_q))
 
-    await page.goto(target_url, timeout=30000)
+    dbg(f"Listing URL: {target_url}")
+    await page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
+    # Krátký wait pro dynamický obsah
+    await page.wait_for_timeout(1500)
+
+    dbg(f"Načteno: {page.url}")
 
     alert = page.locator("div.alert.alert-danger .alert-content")
     if await alert.count() > 0:
@@ -329,19 +334,61 @@ async def get_listing_urls(page: Page, section_url, page_num):
         if "Unfortunately, something went wrong" in txt:
             return []
 
-    links = []
-    cards = await page.locator('.cms-listing-col a.product-name, .cms-listing-col a.btn-detail').all()
+    # Diagnostika: kolik linek /en/ je celkem na stránce?
+    total_en_links = await page.locator('a[href*="/en/"]').count()
+    dbg(f"Celkem /en/ linků na stránce: {total_en_links}")
 
-    for card in cards:
-        href = await card.get_attribute('href')
-        if href:
+    links = set()
+
+    # Strategie 1: původní třídy (Shopware 6 standard)
+    for selector in [
+        '.cms-listing-col a.product-name',
+        '.cms-listing-col a.btn-detail',
+        '.product-box a.product-name',
+        'a.product-name',
+        '.product-name-wrapper a',
+        'article.product-box a[href*="/en/"]',
+        '.card-body a[href*="/en/"]',
+    ]:
+        cards = await page.locator(selector).all()
+        for card in cards:
+            href = await card.get_attribute('href')
+            if href:
+                if '/de/' in href:
+                    href = href.replace('/de/', '/en/')
+                links.add(href)
+        if links:
+            break
+
+    # Strategie 2: všechny /en/ linky s alespoň 3 segmenty za /en/ = produktový detail
+    # Vzor: /en/[kategorie]/[subkategorie]/[vyrobce]/[model]
+    if not links:
+        base_path = parsed.path.rstrip('/')  # např. /en/switches
+        dbg(f"Strategie 2: hledám a[href*=\"{base_path}/\"]")
+        all_anchors = await page.locator(f'a[href*="{base_path}/"]').all()
+        dbg(f"Strategie 2: nalezeno {len(all_anchors)} kotev s touto cestou")
+        for a in all_anchors:
+            href = await a.get_attribute('href')
+            if not href:
+                continue
             if '/de/' in href:
                 href = href.replace('/de/', '/en/')
-            links.append(href)
+            # Ořízni query string pro počítání segmentů
+            path_only = href.split('?')[0].split('#')[0]
+            # Segmenty za /en/
+            en_suffix = path_only.split('/en/')[-1] if '/en/' in path_only else ''
+            parts = [p for p in en_suffix.split('/') if p]
+            # Produkt = min 3 segmenty za /en/ (kategorie/subkat/vyrobce nebo /kategorie/vyrobce/model)
+            if len(parts) >= 3:
+                links.add(href)
+        dbg(f"Strategie 2: po filtraci {len(links)} produktových linků")
+
+    if not links:
+        dbg("VAROVÁNÍ: Žádné produktové linky nenalezeny. Zkontroluj URL a strukturu stránky.")
 
     seen = set()
     unique_links = []
-    for l in links:
+    for l in sorted(links):  # sort pro konzistentní pořadí
         if l not in seen:
             unique_links.append(l)
             seen.add(l)
