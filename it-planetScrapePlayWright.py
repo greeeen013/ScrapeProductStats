@@ -14,12 +14,48 @@ BASE_URL = "https://it-planet.com"
 START_URL = "https://it-planet.com/en"
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROGRESS_FILE = SCRIPT_DIR / "it-planet_progress_v6.json"
+HTML_DUMP_DIR = SCRIPT_DIR / "html_dumps"
 
 
 # === POMOCNÉ FUNKCE ===
 def dbg(msg):
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] {msg}")
+
+
+async def dump_page_html(page, label: str):
+    """Uloží HTML stránky do souboru pro debug."""
+    try:
+        HTML_DUMP_DIR.mkdir(exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        safe_label = re.sub(r'[^a-zA-Z0-9_-]', '_', label)[:60]
+        path = HTML_DUMP_DIR / f"{ts}_{safe_label}.html"
+        html = await page.content()
+        path.write_text(html, encoding="utf-8")
+        dbg(f"HTML dump uložen: {path}")
+    except Exception as e:
+        dbg(f"Nepodařilo se uložit HTML dump: {e}")
+
+
+async def check_cloudflare(page) -> bool:
+    """Vrátí True pokud je stránka blokována Cloudflare challenge."""
+    try:
+        title = await page.title()
+        html_snippet = await page.evaluate("() => document.body ? document.body.innerHTML.slice(0, 4000) : ''")
+        signals = [
+            "just a moment" in title.lower(),
+            "cf-browser-verification" in html_snippet,
+            "checking your browser" in html_snippet.lower(),
+            "challenge-platform" in html_snippet,
+            "ray id" in html_snippet.lower() and "cloudflare" in html_snippet.lower(),
+            "enable javascript and cookies" in html_snippet.lower(),
+        ]
+        if any(signals):
+            dbg(f"CLOUDFLARE DETEKOVÁN: title={title!r}, url={page.url}")
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def clean_text(text):
@@ -170,8 +206,12 @@ async def scrape_product(context, url, semaphore):
         all_rows = []
 
         try:
-            # Necháme CSS běžet
             await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(1000)
+
+            if await check_cloudflare(page):
+                await dump_page_html(page, f"cloudflare_{url.split('/')[-1].split('?')[0]}")
+                raise RuntimeError("Cloudflare challenge – stránka zablokována")
 
             # SPOLEČNÁ DATA
             try:
@@ -262,35 +302,90 @@ async def scrape_product(context, url, semaphore):
             return final_rows, url
 
         except Exception as e:
-            dbg(f"CHYBA {url}: {e}")
+            dbg(f"CHYBA při zpracování {url}: {e}")
+            try:
+                if not page.is_closed():
+                    is_cf = await check_cloudflare(page)
+                    label = f"{'cloudflare' if is_cf else 'error'}_{url.split('/')[-1].split('?')[0]}"
+                    await dump_page_html(page, label)
+            except Exception:
+                pass
             return [], url
         finally:
-            await page.close()
+            try:
+                await page.close()
+            except Exception:
+                pass
 
 
 # === PROCHÁZENÍ KATEGORIÍ ===
 
+FALLBACK_SECTIONS = {
+    "Networking":    f"{BASE_URL}/en/c/networking.html",
+    "Storage":       f"{BASE_URL}/en/c/storage.html",
+    "Server":        f"{BASE_URL}/en/c/server.html",
+    "Power Supply":  f"{BASE_URL}/en/c/power-supply.html",
+}
+
 async def get_sections(context):
     page = await context.new_page()
     dbg("Načítám menu...")
-    await page.goto(START_URL, wait_until="domcontentloaded")
-
     sections = {}
-    ignored = ["blog", "service", "inquiry", "home", "brands", "manufacturer"]
 
-    menu_items = await page.locator('.navigation--list .navigation--entry .navigation--link').all()
+    try:
+        try:
+            await page.goto(START_URL, wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            dbg(f"Homepage load warning (pokračuji): {e}")
+        await page.wait_for_timeout(2000)
 
-    for item in menu_items:
-        title = await item.get_attribute("title")
-        href = await item.get_attribute("href")
+        if await check_cloudflare(page):
+            await dump_page_html(page, "cloudflare_homepage")
+            dbg("FATAL: Homepage blokována Cloudflare – používám záložní sekce")
+            return FALLBACK_SECTIONS
 
-        if title and href:
+        ignored = {"blog", "service", "inquiry", "home", "brands", "manufacturer",
+                   "about", "contact", "career", "imprint", "privacy", "terms",
+                   "shipping", "warranty", "returns", "disposal", "safety",
+                   "declaration", "partner", "right-of", "data-protection",
+                   "general-terms", "inquiry-form"}
+
+        menu_items = await page.locator('.navigation--list .navigation--entry .navigation--link').all()
+
+        for item in menu_items:
+            title = await item.get_attribute("title")
+            href = await item.get_attribute("href")
+            if not (title and href):
+                continue
             clean_title = title.strip()
-            if clean_title.lower() not in ignored and "SupplierModified" not in href:
+            if "SupplierModified" in href:
+                continue
+            if any(ign in clean_title.lower() for ign in ignored):
+                continue
+            # Only accept product category URLs (/en/c/ pattern)
+            if "/en/c/" not in href and href.rstrip("/") != START_URL.rstrip("/"):
+                continue
+            if "/en/c/" in href:
                 full_url = urljoin(BASE_URL, href)
                 sections[clean_title] = full_url
 
-    await page.close()
+        if not sections:
+            dbg("Nepodařilo se načíst sekce z menu, používám záložní seznam")
+            sections = dict(FALLBACK_SECTIONS)
+
+    except Exception as e:
+        dbg(f"Chyba načítání sekcí: {e}")
+        try:
+            await dump_page_html(page, "error_sections")
+        except Exception:
+            pass
+        sections = dict(FALLBACK_SECTIONS)
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
     return sections
 
 
@@ -306,31 +401,50 @@ async def get_listing_urls(page: Page, section_url, page_num):
     dbg(f"  > Listing str {page_num}: {target_url}")
 
     try:
-        await page.goto(target_url, timeout=60000, wait_until="networkidle")
-
         try:
-            await page.wait_for_selector('.product--box', timeout=5000)
-        except:
-            if await page.locator(".alert.is--info").count() > 0:
-                return []
-            pass
+            await page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
+        except Exception as e:
+            dbg(f"Listing load warning (pokračuji): {e}")
+        await page.wait_for_timeout(1500)
+
+        if await check_cloudflare(page):
+            await dump_page_html(page, f"cloudflare_listing_p{page_num}")
+            dbg("FATAL: Listing stránka blokována Cloudflare")
+            return []
+
+        title = await page.title()
+        dbg(f"  Titulek: {title}")
+
+        # Prázdná stránka – konec sekce
+        if await page.locator(".alert.is--info").count() > 0:
+            return []
+        if await page.locator(".product--box").count() == 0:
+            dbg("  Žádné product--box elementy, konec sekce")
+            return []
 
         links = []
         buttons = await page.locator('.product--box .product--detail-btn a').all()
         for btn in buttons:
             href = await btn.get_attribute('href')
-            if href: links.append(href)
+            if href:
+                links.append(href)
 
         if not links:
             titles = await page.locator('.product--box .product--title').all()
             for t in titles:
                 href = await t.get_attribute('href')
-                if href: links.append(href)
+                if href:
+                    links.append(href)
 
+        dbg(f"  Nalezeno produktů: {len(set(links))}")
         return list(set(links))
 
     except Exception as e:
         dbg(f"Chyba listingu: {e}")
+        try:
+            await dump_page_html(page, f"error_listing_p{page_num}")
+        except Exception:
+            pass
         return []
 
 
