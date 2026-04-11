@@ -24,6 +24,7 @@ def alza_wait_and_close():
     )
     #chrome_options.add_argument("--headless=new")  # Pro běh na pozadí
     chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--proxy-server=socks5://127.0.0.1:40000")
 
     driver = None
     try:

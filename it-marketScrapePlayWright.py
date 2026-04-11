@@ -429,7 +429,7 @@ async def main():
     max_pages = int(max_pages_input) if max_pages_input.isdigit() else None
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless, args=["--disable-gpu"])
+        browser = await p.chromium.launch(headless=headless, args=["--disable-gpu"], proxy={"server": "socks5://127.0.0.1:40000"})
         context = await browser.new_context(viewport={"width": 1600, "height": 1200})
 
         print("Načítám sekce...")

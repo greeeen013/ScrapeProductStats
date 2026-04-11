@@ -344,7 +344,7 @@ async def main():
     max_concurrent = int(w_input) if w_input.isdigit() else 3
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=True, proxy={"server": "socks5://127.0.0.1:40000"})
         context = await browser.new_context(viewport={"width": 1600, "height": 1000})
 
         try:

@@ -1,4 +1,6 @@
 import requests
+
+WARP_PROXY = {"http": "socks5h://127.0.0.1:40000", "https": "socks5h://127.0.0.1:40000"}
 from bs4 import BeautifulSoup
 import time
 from urllib.parse import urljoin
@@ -10,7 +12,7 @@ import os
 def ziskej_vyrobce():
     """Získá seznam všech výrobců z hlavní stránky"""
     url = "https://www.myprojectorlamps.eu"
-    response = requests.get(url)
+    response = requests.get(url, proxies=WARP_PROXY)
     soup = BeautifulSoup(response.content, 'html.parser')
 
     select = soup.find('select', {'id': 'brands-select'})
@@ -28,7 +30,7 @@ def ziskej_vyrobce():
 def ziskej_produkty_vyrobce(vyrobce_nazev):
     """Získá všechny produkty konkrétního výrobce"""
     url = f"https://www.myprojectorlamps.eu/projectors/{vyrobce_nazev}"
-    response = requests.get(url)
+    response = requests.get(url, proxies=WARP_PROXY)
     soup = BeautifulSoup(response.content, 'html.parser')
 
     select = soup.find('select', {'id': 'lamps-select'})
@@ -45,7 +47,7 @@ def ziskej_produkty_vyrobce(vyrobce_nazev):
 
 def zpracuj_produkt(url, ws, row_index):
     """Zpracuje detail produktu a zapíše data do Excelu"""
-    response = requests.get(url)
+    response = requests.get(url, proxies=WARP_PROXY)
     soup = BeautifulSoup(response.content, 'html.parser')
 
     # Získání technických informací

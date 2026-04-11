@@ -1,4 +1,6 @@
 import requests
+
+WARP_PROXY = {"http": "socks5h://127.0.0.1:40000", "https": "socks5h://127.0.0.1:40000"}
 from bs4 import BeautifulSoup
 import csv
 import os
@@ -28,7 +30,7 @@ def smicro_scrape_product_page():
         print(f"Scrapuji stránku: {page + 1}")
 
         # Získání HTML obsahu
-        response = requests.get(url)
+        response = requests.get(url, proxies=WARP_PROXY)
         if response.status_code != 200:
             print(f"Chyba při načítání stránky: {response.status_code}")
             break
@@ -131,7 +133,7 @@ def convert_csv_to_excel(csv_filename):
 
 def smicro_scrape_product_details(url):
     """Funkce pro scrapování detailů jednotlivého produktu"""
-    response = requests.get(url)
+    response = requests.get(url, proxies=WARP_PROXY)
     if response.status_code != 200:
         print(f"Chyba při načítání produktu: {response.status_code}")
         return None
