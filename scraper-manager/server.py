@@ -400,9 +400,9 @@ async def _check_proxy() -> dict:
         "proxy_ok": False,
         "error": None,
     }
-    proxies = {"http://": PROXY_SOCKS, "https://": PROXY_SOCKS}
+    transport = httpx.AsyncHTTPTransport(proxy=PROXY_SOCKS)
     try:
-        async with httpx.AsyncClient(proxies=proxies, timeout=10) as client:
+        async with httpx.AsyncClient(transport=transport, timeout=10) as client:
             r = await client.get("https://www.cloudflare.com/cdn-cgi/trace")
             for line in r.text.strip().splitlines():
                 if "=" in line:
@@ -419,7 +419,7 @@ async def _check_proxy() -> dict:
         result["error"] = str(e)
 
     try:
-        async with httpx.AsyncClient(proxies=proxies, timeout=10) as client:
+        async with httpx.AsyncClient(transport=transport, timeout=10) as client:
             r = await client.get("http://ip-api.com/json/?fields=query,country,city,isp,org")
             data = r.json()
             result["ip"] = data.get("query") or result["ip"]
