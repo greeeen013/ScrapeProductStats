@@ -4,12 +4,14 @@
 import asyncio
 import json
 import sys
+import time
 import uuid
 from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -26,7 +28,7 @@ SCRAPERS = {
         "name": "SMicro.cz",
         "description": "Scraper pro smicro.cz – paměti, komponenty",
         "script": str(SCRAPERS_DIR / "smicroScrapePlayWright.py"),
-        "output_csv": str(SCRAPERS_DIR / "smicro_products.csv"),
+        "output_file": str(SCRAPERS_DIR / "smicro_products.csv"),
         "progress_file": str(SCRAPERS_DIR / "smicroScrapeLastProduct.json"),
         "inputs": [
             {
@@ -66,7 +68,7 @@ SCRAPERS = {
         "name": "IT-Planet.cz",
         "description": "Scraper pro it-planet.cz – IT hardware",
         "script": str(SCRAPERS_DIR / "it-planetScrapePlayWright.py"),
-        "output_csv": str(SCRAPERS_DIR / "it-planet_data.csv"),
+        "output_file": str(SCRAPERS_DIR / "it-planet_data.csv"),
         "progress_file": str(SCRAPERS_DIR / "it-planet_progress_v6.json"),
         "inputs": [
             {
@@ -98,7 +100,7 @@ SCRAPERS = {
         "name": "IT-Market.com",
         "description": "Scraper pro it-market.com – IT vybavení",
         "script": str(SCRAPERS_DIR / "it-marketScrapePlayWright.py"),
-        "output_csv": str(SCRAPERS_DIR / "it-market.csv"),
+        "output_file": str(SCRAPERS_DIR / "it-market.csv"),
         "progress_file": str(SCRAPERS_DIR / "it-marketScrapeLastProduct.json"),
         "inputs": [
             {
@@ -140,11 +142,36 @@ SCRAPERS = {
             },
         ],
     },
+    "projector-lamps": {
+        "id": "projector-lamps",
+        "name": "MyProjectorLamps.eu",
+        "description": "Scraper pro myprojectorlamps.eu – projektorové lampy",
+        "script": str(SCRAPERS_DIR / "projectorLampScrape.py"),
+        "output_file": str(SCRAPERS_DIR / "vysledky.xlsx"),
+        "progress_file": "",  # nemá progress soubor
+        "inputs": [
+            {
+                "id": "brand",
+                "label": "Výrobce",
+                "default": "vše",
+                "hint": "'vše' = všichni výrobci, číslo nebo název konkrétního výrobce",
+                "type": "text",
+            },
+        ],
+    },
 }
 
 # Označení dostupnosti (script musí existovat)
 for sid, cfg in SCRAPERS.items():
     cfg["available"] = Path(cfg["script"]).exists()
+
+# ============================================================
+# Proxy / WARP status cache
+# ============================================================
+PROXY_SOCKS = "socks5://127.0.0.1:40000"
+PROXY_CACHE_TTL = 60  # sekund
+
+_proxy_cache: dict = {"ts": 0.0, "data": None}
 
 # ============================================================
 # In-memory storage
@@ -181,10 +208,10 @@ async def get_scrapers():
     result = []
     for cfg in SCRAPERS.values():
         entry = {k: v for k, v in cfg.items()}
-        # Přidat info o existenci progress souboru
-        entry["has_progress"] = Path(cfg["progress_file"]).exists()
-        # Přidat info o existenci výstupního CSV
-        entry["has_output"] = Path(cfg["output_csv"]).exists()
+        entry["has_progress"] = bool(cfg["progress_file"]) and Path(cfg["progress_file"]).exists()
+        out = Path(cfg["output_file"])
+        entry["has_output"] = out.exists()
+        entry["output_rows"] = _count_rows(out) if out.exists() else None
         result.append(entry)
     return result
 
@@ -258,10 +285,45 @@ async def download_result(run_id: str):
     scraper = SCRAPERS.get(run["scraper_id"])
     if not scraper:
         raise HTTPException(400)
-    csv_path = Path(scraper["output_csv"])
-    if not csv_path.exists():
+    out_path = Path(scraper["output_file"])
+    if not out_path.exists():
         raise HTTPException(404, "Výstupní soubor nenalezen – scraper ještě nedoběhl nebo nic nestáhl")
-    return FileResponse(str(csv_path), filename=csv_path.name, media_type="text/csv")
+    suffix = out_path.suffix.lower()
+    media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if suffix == ".xlsx" else "text/csv"
+    return FileResponse(str(out_path), filename=out_path.name, media_type=media)
+
+
+@app.get("/api/proxy-status")
+async def proxy_status(refresh: bool = False):
+    """Vrátí stav proxy/WARP (cachováno 60s)."""
+    now = time.time()
+    if not refresh and _proxy_cache["data"] and (now - _proxy_cache["ts"]) < PROXY_CACHE_TTL:
+        return _proxy_cache["data"]
+    data = await _check_proxy()
+    _proxy_cache["ts"] = now
+    _proxy_cache["data"] = data
+    return data
+
+
+@app.post("/api/proxy-check-full")
+async def proxy_check_full():
+    """Spustí check_ip.py jako subprocess a vrátí raw výstup."""
+    script = SCRAPERS_DIR / "check_ip.py"
+    if not script.exists():
+        raise HTTPException(404, "check_ip.py nenalezen")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-u", str(script),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(SCRAPERS_DIR),
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        return {"output": stdout.decode("utf-8", errors="replace"), "exit_code": proc.returncode}
+    except asyncio.TimeoutError:
+        return {"output": "Timeout – check_ip.py neodpověděl do 30s", "exit_code": -1}
+    except Exception as e:
+        return {"output": f"Chyba: {e}", "exit_code": -1}
 
 
 @app.websocket("/ws/runs/{run_id}")
@@ -305,6 +367,72 @@ async def ws_logs(websocket: WebSocket, run_id: str):
 # ============================================================
 # Helpers
 # ============================================================
+def _count_rows(path: Path) -> Optional[int]:
+    """Počet datových řádků ve výstupním souboru (bez hlavičky)."""
+    try:
+        suffix = path.suffix.lower()
+        if suffix == ".xlsx":
+            import openpyxl
+            wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+            ws = wb.active
+            count = max(0, ws.max_row - 1)  # odečíst hlavičku
+            wb.close()
+            return count
+        else:
+            # CSV – počítáme řádky bez hlavičky
+            with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+                count = sum(1 for _ in f) - 1
+            return max(0, count)
+    except Exception:
+        return None
+
+
+async def _check_proxy() -> dict:
+    """Zavolá Cloudflare trace + ip-api přes SOCKS5 proxy a vrátí stav."""
+    result: dict = {
+        "warp": "unknown",
+        "ip": None,
+        "loc": None,
+        "country": None,
+        "city": None,
+        "isp": None,
+        "org": None,
+        "proxy_ok": False,
+        "error": None,
+    }
+    proxies = {"http://": PROXY_SOCKS, "https://": PROXY_SOCKS}
+    try:
+        async with httpx.AsyncClient(proxies=proxies, timeout=10) as client:
+            r = await client.get("https://www.cloudflare.com/cdn-cgi/trace")
+            for line in r.text.strip().splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip()
+                    if k == "warp":
+                        result["warp"] = v
+                    elif k == "ip":
+                        result["ip"] = v
+                    elif k == "loc":
+                        result["loc"] = v
+            result["proxy_ok"] = True
+    except Exception as e:
+        result["error"] = str(e)
+
+    try:
+        async with httpx.AsyncClient(proxies=proxies, timeout=10) as client:
+            r = await client.get("http://ip-api.com/json/?fields=query,country,city,isp,org")
+            data = r.json()
+            result["ip"] = data.get("query") or result["ip"]
+            result["country"] = data.get("country")
+            result["city"] = data.get("city")
+            result["isp"] = data.get("isp")
+            result["org"] = data.get("org")
+    except Exception:
+        pass  # CF trace already gave us IP
+
+    return result
+
+
 def _run_public(run: dict) -> dict:
     return {
         "id": run["id"],
@@ -329,6 +457,10 @@ def _build_stdin(scraper: dict, inputs: dict) -> List[str]:
                 continue
         val = inputs.get(fid, inp.get("default", ""))
         lines.append(val)
+    # Pro projector scraper mapovat 'brand' na správný klíč
+    # (scraper volá input() jednou – brand/výrobce)
+    if scraper["id"] == "projector-lamps":
+        return [inputs.get("brand", "vše")]
     return lines
 
 
