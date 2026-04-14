@@ -48,6 +48,12 @@ PROGRESS_FILE = SCRIPT_DIR / "it-marketScrapeLastProduct.json"
 HTML_DUMP_DIR = SCRIPT_DIR / "html_dumps"
 
 
+# === VÝJIMKY ===
+class ProxyConnectionError(Exception):
+    """Proxy se odpojila – je třeba restartovat browser bez proxy."""
+    pass
+
+
 # === POMOCNÉ FUNKCE PRO LOGOVÁNÍ ===
 def dbg(msg):
     ts = time.strftime("%H:%M:%S")
@@ -397,7 +403,12 @@ async def scrape_product(context, url, semaphore):
 
             return final_rows, url
 
+        except ProxyConnectionError:
+            raise
         except Exception as e:
+            err_str = str(e)
+            if "ERR_PROXY_CONNECTION_FAILED" in err_str or "ERR_PROXY" in err_str:
+                raise ProxyConnectionError(f"Proxy selhala při scraping produktu {url}: {e}") from e
             dbg(f"CHYBA při zpracování {url}: {e}")
             try:
                 if not page.is_closed():
@@ -425,6 +436,9 @@ async def get_listing_urls(page: Page, section_url, page_num):
     try:
         await page.goto(target_url, timeout=60000, wait_until="networkidle")
     except Exception as e:
+        err_str = str(e)
+        if "ERR_PROXY_CONNECTION_FAILED" in err_str or "ERR_PROXY" in err_str or "PROXY" in err_str.upper():
+            raise ProxyConnectionError(f"Proxy selhala při načítání listingu: {e}") from e
         dbg(f"Listing load warning (pokračuji): {e}")
     await page.wait_for_timeout(2000)
 
@@ -688,8 +702,8 @@ async def main():
         print(f"Proxy {PROXY_URL} nedostupna - pripojuji primo.")
         proxy_cfg = None
 
-    async with async_playwright() as p:
-        launch_kwargs = dict(
+    async def create_context(playwright_instance, cfg):
+        lk = dict(
             headless=headless,
             args=[
                 "--disable-gpu",
@@ -698,11 +712,10 @@ async def main():
                 "--disable-dev-shm-usage",
             ],
         )
-        if proxy_cfg:
-            launch_kwargs["proxy"] = proxy_cfg
-
-        browser = await p.chromium.launch(**launch_kwargs)
-        context = await browser.new_context(
+        if cfg:
+            lk["proxy"] = cfg
+        br = await playwright_instance.chromium.launch(**lk)
+        ctx = await br.new_context(
             viewport={"width": 1600, "height": 1200},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             extra_http_headers={
@@ -711,12 +724,15 @@ async def main():
             },
             java_script_enabled=True,
         )
-        # Stealth: schovej webdriver příznak
-        await context.add_init_script(STEALTH_JS)
+        await ctx.add_init_script(STEALTH_JS)
         if STEALTH_AVAILABLE:
             dbg("playwright-stealth k dispozici, aplikuji na kontext")
         else:
             dbg("playwright-stealth není nainstalován, používám manuální stealth")
+        return br, ctx
+
+    async with async_playwright() as p:
+        browser, context = await create_context(p, proxy_cfg)
 
         print("Načítám sekce...")
         try:
@@ -774,8 +790,9 @@ async def main():
         semaphore = asyncio.Semaphore(max_concurrent)
 
         total_processed = 0
+        i = start_sec_idx
 
-        for i in range(start_sec_idx, len(selected_sections)):
+        while i < len(selected_sections):
             sec_name = selected_sections[i]
             sec_url = sections[sec_name]
             print(f"\n>>> Zpracovávám sekci: {sec_name}")
@@ -784,49 +801,88 @@ async def main():
             current_prod_idx = start_prod_idx if i == start_sec_idx else 1
 
             listing_page_obj = await context.new_page()
+            proxy_failed = False
 
-            while True:
-                if max_pages and current_page > max_pages:
-                    print("Dosažen limit stránek.")
-                    break
+            try:
+                while True:
+                    if max_pages and current_page > max_pages:
+                        print("Dosažen limit stránek.")
+                        break
 
-                print(f"  > Načítám listing stranu {current_page}...")
-                urls = await get_listing_urls(listing_page_obj, sec_url, current_page)
-
-                if not urls:
-                    print("  > Žádné další produkty, konec sekce.")
-                    break
-
-                urls_to_process = urls[(current_prod_idx - 1):]
-                if not urls_to_process and current_prod_idx > 1:
-                    break
-
-                print(f"    > Nalezeno {len(urls)} produktů (zpracuji {len(urls_to_process)})")
-
-                pending_tasks = []
-                for idx_on_page_rel, p_url in enumerate(urls_to_process):
-                    real_idx = (current_prod_idx - 1) + idx_on_page_rel + 1
-                    coro = scrape_product(context, p_url, semaphore)
-                    task = asyncio.create_task(coro)
-                    pending_tasks.append(task)
-
-                for completed_task in asyncio.as_completed(pending_tasks):
+                    print(f"  > Načítám listing stranu {current_page}...")
                     try:
-                        rows, url_done = await completed_task
-                        if rows:
-                            writer.write(rows)
-                            total_processed += 1
-                            dbg(f"Hotovo ({total_processed}): {url_done}")
-                    except Exception as e:
-                        print(f"CHYBA v tasku: {e}")
+                        urls = await get_listing_urls(listing_page_obj, sec_url, current_page)
+                    except ProxyConnectionError as e:
+                        print(f"\n!!! PROXY SELHALA: {e}")
+                        proxy_failed = True
+                        break
 
-                await save_progress(sec_name, current_page + 1, 1, "End of Page")
+                    if not urls:
+                        print("  > Žádné další produkty, konec sekce.")
+                        break
 
-                current_page += 1
-                current_prod_idx = 1
+                    urls_to_process = urls[(current_prod_idx - 1):]
+                    if not urls_to_process and current_prod_idx > 1:
+                        break
 
-            await listing_page_obj.close()
+                    print(f"    > Nalezeno {len(urls)} produktů (zpracuji {len(urls_to_process)})")
+
+                    pending_tasks = []
+                    for idx_on_page_rel, p_url in enumerate(urls_to_process):
+                        coro = scrape_product(context, p_url, semaphore)
+                        task = asyncio.create_task(coro)
+                        pending_tasks.append(task)
+
+                    page_proxy_failed = False
+                    for completed_task in asyncio.as_completed(pending_tasks):
+                        try:
+                            rows, url_done = await completed_task
+                            if rows:
+                                writer.write(rows)
+                                total_processed += 1
+                                dbg(f"Hotovo ({total_processed}): {url_done}")
+                        except ProxyConnectionError as e:
+                            print(f"\n!!! PROXY SELHALA v produktovém tasku: {e}")
+                            page_proxy_failed = True
+                            # Zruš zbývající tasky
+                            for t in pending_tasks:
+                                t.cancel()
+                            break
+                        except Exception as e:
+                            print(f"CHYBA v tasku: {e}")
+
+                    if page_proxy_failed:
+                        proxy_failed = True
+                        break
+
+                    await save_progress(sec_name, current_page + 1, 1, "End of Page")
+                    current_page += 1
+                    current_prod_idx = 1
+
+            finally:
+                try:
+                    await listing_page_obj.close()
+                except Exception:
+                    pass
+
+            if proxy_failed:
+                print("\n>>> Proxy se odpojila – restartuji browser bez proxy a pokračuji...")
+                await save_progress(sec_name, current_page, current_prod_idx, "proxy_fail_restart")
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                proxy_cfg = None
+                browser, context = await create_context(p, proxy_cfg)
+                semaphore = asyncio.Semaphore(max_concurrent)
+                # Pokračuj od aktuální sekce a stránky (nezvedáme i)
+                start_sec_idx = i
+                start_page = current_page
+                start_prod_idx = current_prod_idx
+                continue
+
             start_page = 1
+            i += 1
 
         print("\n=== Hotovo ===")
         print(f"Celkem zpracováno produktů: {total_processed}")

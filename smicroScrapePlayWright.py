@@ -263,14 +263,24 @@ async def scrape_product(context, url, semaphore):
             await page.route("**/*.{png,jpg,jpeg,gif,webp}", lambda route: route.abort())
 
             loaded = False
-            for attempt in range(3):
+            attempt = 0
+            while True:
+                attempt += 1
                 try:
                     await page.goto(url, timeout=90000, wait_until="commit")
                     loaded = True
                     break
                 except Exception as e:
-                    dbg(f"    Timeout/Error ({url}) pokus {attempt + 1}: {str(e)[:50]}...")
-                    await asyncio.sleep(3)
+                    err_str = str(e)
+                    if "ERR_SOCKS_CONNECTION_FAILED" in err_str:
+                        dbg(f"    Proxy nedostupná ({url}) – ban detekován. Čekám 15 minut před pokusem {attempt + 1}...")
+                        await asyncio.sleep(15 * 60)
+                    elif attempt >= 3:
+                        dbg(f"    Chyba ({url}) po {attempt} pokusech: {err_str[:50]}...")
+                        break
+                    else:
+                        dbg(f"    Timeout/Error ({url}) pokus {attempt}: {err_str[:50]}...")
+                        await asyncio.sleep(3)
 
             if not loaded:
                 dbg(f"SKIP: Nepodařilo se načíst {url}")
