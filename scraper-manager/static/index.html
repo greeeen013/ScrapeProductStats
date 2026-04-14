@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Scraper Manager</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0d1117;
+      --surface:   #161b22;
+      --surface2:  #21262d;
+      --border:    #30363d;
+      --text:      #e6edf3;
+      --muted:     #8b949e;
+      --accent:    #388bfd;
+      --accent-h:  #58a6ff;
+      --green:     #3fb950;
+      --yellow:    #d29922;
+      --red:       #f85149;
+      --orange:    #db6d28;
+      --radius:    8px;
+      --font:      'Segoe UI', system-ui, sans-serif;
+    }
+
+    body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; min-height: 100vh; }
+
+    /* ── LAYOUT ── */
+    .app { display: grid; grid-template-rows: 52px 1fr; height: 100vh; }
+
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 12px;
+      padding: 0 20px;
+    }
+    header h1 { font-size: 16px; font-weight: 600; }
+    header .badge { background: var(--accent); color: #fff; font-size: 11px; padding: 2px 7px; border-radius: 20px; }
+
+    .main { display: grid; grid-template-columns: 320px 1fr; overflow: hidden; }
+
+    /* ── SIDEBAR ── */
+    .sidebar {
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+      display: flex; flex-direction: column; gap: 0;
+    }
+    .sidebar-section { padding: 14px 16px 8px; font-size: 11px; font-weight: 600; color: var(--muted); letter-spacing: .06em; text-transform: uppercase; }
+
+    /* Scraper cards */
+    .scraper-card {
+      margin: 4px 10px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px 14px;
+      cursor: default;
+    }
+    .scraper-card .top { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+    .scraper-card .name { font-weight: 600; font-size: 14px; }
+    .scraper-card .desc { color: var(--muted); font-size: 12px; margin-top: 3px; }
+    .scraper-card .badges { display: flex; gap: 5px; margin-top: 8px; flex-wrap: wrap; }
+    .scraper-card .actions { display: flex; gap: 6px; margin-top: 10px; }
+
+    .pill {
+      font-size: 11px; padding: 2px 8px; border-radius: 20px;
+      border: 1px solid transparent;
+    }
+    .pill.progress  { border-color: var(--yellow); color: var(--yellow); }
+    .pill.has-file  { border-color: var(--green);  color: var(--green);  }
+    .pill.unavail   { border-color: var(--red);    color: var(--red);    }
+
+    /* ── BUTTONS ── */
+    .btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      border: none; border-radius: var(--radius);
+      padding: 6px 14px; font-size: 13px; font-family: inherit;
+      cursor: pointer; font-weight: 500; transition: opacity .15s;
+      text-decoration: none;
+    }
+    .btn:disabled { opacity: .4; cursor: not-allowed; }
+    .btn:not(:disabled):hover { opacity: .85; }
+    .btn.primary  { background: var(--accent);  color: #fff; }
+    .btn.danger   { background: var(--red);     color: #fff; }
+    .btn.ghost    { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+    .btn.success  { background: var(--green);   color: #000; }
+    .btn.sm { padding: 4px 10px; font-size: 12px; }
+
+    /* ── CONTENT ── */
+    .content { display: flex; flex-direction: column; overflow: hidden; }
+
+    /* Run list */
+    .runs-pane { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+    .runs-pane .empty { color: var(--muted); text-align: center; margin-top: 40px; }
+
+    .run-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px 14px;
+      cursor: pointer;
+      transition: border-color .15s;
+    }
+    .run-card:hover { border-color: var(--accent); }
+    .run-card.active { border-color: var(--accent); background: var(--surface2); }
+
+    .run-card .row1 { display: flex; align-items: center; gap: 8px; }
+    .run-card .rname { font-weight: 600; }
+    .run-card .row2 { margin-top: 4px; color: var(--muted); font-size: 12px; display: flex; gap: 10px; }
+    .run-card .row3 { margin-top: 8px; display: flex; gap: 6px; }
+
+    /* Status badges */
+    .status {
+      font-size: 11px; font-weight: 600; padding: 2px 8px;
+      border-radius: 20px; display: inline-flex; align-items: center; gap: 4px;
+    }
+    .status.running   { background: #1f3a5f; color: var(--accent-h); }
+    .status.completed { background: #122922; color: var(--green); }
+    .status.failed    { background: #3d1515; color: var(--red); }
+    .status.stopped   { background: #2d2208; color: var(--yellow); }
+
+    .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+    .running  .dot { background: var(--accent-h); animation: pulse 1.2s ease-in-out infinite; }
+    .completed .dot { background: var(--green); }
+    .failed   .dot { background: var(--red); }
+    .stopped  .dot { background: var(--yellow); }
+
+    @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.3 } }
+
+    /* Log viewer */
+    .log-pane {
+      border-top: 1px solid var(--border);
+      display: flex; flex-direction: column;
+      height: 340px; min-height: 200px;
+      resize: vertical; overflow: hidden;
+    }
+    .log-pane.hidden { display: none; }
+
+    .log-header {
+      background: var(--surface2);
+      border-bottom: 1px solid var(--border);
+      padding: 8px 14px;
+      display: flex; align-items: center; justify-content: space-between;
+      flex-shrink: 0;
+    }
+    .log-header .title { font-size: 12px; font-weight: 600; color: var(--muted); }
+
+    .log-body {
+      flex: 1; overflow-y: auto; padding: 10px 14px;
+      font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 12px;
+      line-height: 1.6; background: #010409;
+      white-space: pre-wrap; word-break: break-all;
+    }
+    .log-body .log-line { display: block; }
+    .log-body .log-line.err { color: var(--red); }
+    .log-body .log-line.warn { color: var(--yellow); }
+    .log-body .log-line.ok  { color: var(--green); }
+
+    /* ── MODAL ── */
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,.65);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 100; opacity: 0; pointer-events: none; transition: opacity .2s;
+    }
+    .modal-overlay.open { opacity: 1; pointer-events: all; }
+
+    .modal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      width: 480px; max-width: 95vw; max-height: 90vh;
+      display: flex; flex-direction: column;
+      transform: translateY(12px); transition: transform .2s;
+    }
+    .modal-overlay.open .modal { transform: translateY(0); }
+
+    .modal-header {
+      padding: 18px 20px 14px;
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .modal-header h2 { font-size: 16px; }
+    .modal-close { background: none; border: none; color: var(--muted); font-size: 20px; cursor: pointer; line-height: 1; }
+    .modal-close:hover { color: var(--text); }
+
+    .modal-body { padding: 18px 20px; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 14px; }
+    .modal-footer { padding: 14px 20px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end; }
+
+    /* Form */
+    .form-group { display: flex; flex-direction: column; gap: 5px; }
+    .form-group label { font-size: 12px; font-weight: 600; color: var(--muted); }
+    .form-group .hint { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    .form-group input, .form-group select {
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: var(--radius); color: var(--text);
+      padding: 7px 10px; font-size: 13px; font-family: inherit;
+      outline: none; transition: border-color .15s;
+    }
+    .form-group input:focus, .form-group select:focus { border-color: var(--accent); }
+    .form-group select option { background: var(--surface2); }
+    .form-group.hidden { display: none; }
+
+    /* ── TOAST ── */
+    #toast {
+      position: fixed; bottom: 20px; right: 20px;
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 10px 16px;
+      font-size: 13px; opacity: 0; pointer-events: none;
+      transition: opacity .3s; z-index: 200;
+    }
+    #toast.show { opacity: 1; }
+    #toast.err { border-color: var(--red); color: var(--red); }
+    #toast.ok  { border-color: var(--green); color: var(--green); }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  </style>
+</head>
+<body>
+<div class="app">
+
+  <!-- Header -->
+  <header>
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round">
+      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+    </svg>
+    <h1>Scraper Manager</h1>
+    <span class="badge" id="running-badge" style="display:none">0 běží</span>
+    <div style="flex:1"></div>
+    <button class="btn ghost sm" onclick="refresh()">↻ Obnovit</button>
+  </header>
+
+  <div class="main">
+
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-section">Dostupné scrapery</div>
+      <div id="scrapers-list"></div>
+    </aside>
+
+    <!-- Content -->
+    <div class="content">
+      <div class="runs-pane" id="runs-pane">
+        <div class="empty" id="runs-empty">Zatím žádné runy. Spusť scraper z levého panelu.</div>
+      </div>
+
+      <!-- Log viewer -->
+      <div class="log-pane hidden" id="log-pane">
+        <div class="log-header">
+          <span class="title" id="log-title">Logy</span>
+          <div style="display:flex;gap:6px">
+            <label style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:4px;cursor:pointer">
+              <input type="checkbox" id="autoscroll-cb" checked> auto-scroll
+            </label>
+            <button class="btn ghost sm" onclick="closeLog()">✕ Zavřít</button>
+          </div>
+        </div>
+        <div class="log-body" id="log-body"></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Modal: Spustit scraper -->
+<div class="modal-overlay" id="modal-overlay" onclick="closeModalOutside(event)">
+  <div class="modal">
+    <div class="modal-header">
+      <h2 id="modal-title">Spustit scraper</h2>
+      <button class="modal-close" onclick="closeModal()">×</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-footer">
+      <button class="btn ghost" onclick="closeModal()">Zrušit</button>
+      <button class="btn primary" id="modal-submit" onclick="submitRun()">▶ Spustit</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ── State ──
+let scrapers = [];
+let runs = [];
+let activeRunId = null;
+let activeWs = null;
+let refreshTimer = null;
+
+// ── Init ──
+document.addEventListener('DOMContentLoaded', () => {
+  loadScrapers();
+  loadRuns();
+  refreshTimer = setInterval(refresh, 5000);
+});
+
+// ── API helpers ──
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    const txt = await r.text().catch(() => r.statusText);
+    throw new Error(txt);
+  }
+  return r.json().catch(() => null);
+}
+
+// ── Load data ──
+async function loadScrapers() {
+  try {
+    scrapers = await api('GET', '/api/scrapers');
+    renderScrapers();
+  } catch(e) { toast('Chyba načtení scraperů: ' + e.message, 'err'); }
+}
+
+async function loadRuns() {
+  try {
+    runs = await api('GET', '/api/runs');
+    renderRuns();
+    updateBadge();
+  } catch(e) {}
+}
+
+async function refresh() {
+  await loadRuns();
+  // Refresh scraper availability (progress files mohou přibýt/ubýt)
+  await loadScrapers();
+}
+
+// ── Render scrapers ──
+function renderScrapers() {
+  const el = document.getElementById('scrapers-list');
+  el.innerHTML = '';
+  for (const s of scrapers) {
+    const card = document.createElement('div');
+    card.className = 'scraper-card';
+    const badges = [];
+    if (!s.available)  badges.push('<span class="pill unavail">script chybí</span>');
+    if (s.has_progress) badges.push('<span class="pill progress">⚠ progress soubor</span>');
+    if (s.has_output)   badges.push('<span class="pill has-file">CSV existuje</span>');
+
+    card.innerHTML = `
+      <div class="top">
+        <div>
+          <div class="name">${s.name}</div>
+          <div class="desc">${s.description}</div>
+        </div>
+      </div>
+      ${badges.length ? `<div class="badges">${badges.join('')}</div>` : ''}
+      <div class="actions">
+        <button class="btn primary sm" ${!s.available ? 'disabled' : ''} onclick="openModal('${s.id}')">▶ Spustit</button>
+        ${s.has_output ? `<button class="btn ghost sm" onclick="downloadLatest('${s.id}')">⬇ Stáhnout CSV</button>` : ''}
+      </div>
+    `;
+    el.appendChild(card);
+  }
+}
+
+// ── Render runs ──
+function renderRuns() {
+  const pane = document.getElementById('runs-pane');
+  const empty = document.getElementById('runs-empty');
+
+  // Remove existing run cards (keep empty placeholder)
+  [...pane.querySelectorAll('.run-card')].forEach(c => c.remove());
+
+  if (runs.length === 0) {
+    empty.style.display = '';
+    return;
+  }
+  empty.style.display = 'none';
+
+  for (const r of runs) {
+    const el = document.createElement('div');
+    el.className = 'run-card' + (r.id === activeRunId ? ' active' : '');
+    el.dataset.id = r.id;
+    el.onclick = () => openLog(r.id);
+
+    const dur = duration(r.started_at, r.finished_at);
+    const inputsStr = Object.entries(r.inputs || {}).map(([k,v]) => v ? `${k}=${v}` : null).filter(Boolean).join(', ');
+
+    el.innerHTML = `
+      <div class="row1">
+        <span class="status ${r.status}"><span class="dot"></span>${statusLabel(r.status)}</span>
+        <span class="rname">${r.scraper_name}</span>
+        <span style="color:var(--muted);font-size:12px;margin-left:auto">#${r.id}</span>
+      </div>
+      <div class="row2">
+        <span>Začátek: ${fmtTime(r.started_at)}</span>
+        ${r.finished_at ? `<span>Konec: ${fmtTime(r.finished_at)}</span>` : ''}
+        ${dur ? `<span>${dur}</span>` : ''}
+        <span>${r.log_lines} řádků</span>
+      </div>
+      ${inputsStr ? `<div class="row2" style="margin-top:2px"><span style="font-size:11px">${inputsStr}</span></div>` : ''}
+      <div class="row3">
+        <button class="btn ghost sm" onclick="event.stopPropagation();openLog('${r.id}')">📋 Logy</button>
+        ${r.status === 'running' ? `<button class="btn danger sm" onclick="event.stopPropagation();stopRun('${r.id}')">⏹ Zastavit</button>` : ''}
+        <button class="btn ghost sm" onclick="event.stopPropagation();downloadRun('${r.id}')">⬇ CSV</button>
+      </div>
+    `;
+    pane.appendChild(el);
+  }
+}
+
+function updateBadge() {
+  const count = runs.filter(r => r.status === 'running').length;
+  const badge = document.getElementById('running-badge');
+  if (count > 0) {
+    badge.style.display = '';
+    badge.textContent = `${count} běží`;
+  } else {
+    badge.style.display = 'none';
+  }
+}
+
+// ── Log viewer ──
+function openLog(runId) {
+  activeRunId = runId;
+  const logPane = document.getElementById('log-pane');
+  const logBody = document.getElementById('log-body');
+  const logTitle = document.getElementById('log-title');
+
+  logPane.classList.remove('hidden');
+  logBody.innerHTML = '';
+
+  const run = runs.find(r => r.id === runId);
+  if (run) logTitle.textContent = `Logy – ${run.scraper_name} #${runId}`;
+
+  // Mark active card
+  document.querySelectorAll('.run-card').forEach(c => c.classList.toggle('active', c.dataset.id === runId));
+
+  // Close previous WS
+  if (activeWs) { activeWs.close(); activeWs = null; }
+
+  // Load existing logs via REST first
+  api('GET', `/api/runs/${runId}`).then(data => {
+    logBody.innerHTML = '';
+    for (const line of (data.logs || [])) appendLine(line);
+    scrollLog();
+
+    // If still running, open WS for live updates
+    if (data.status === 'running') {
+      connectWs(runId);
+    }
+  });
+}
+
+function connectWs(runId) {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws/runs/${runId}`);
+  activeWs = ws;
+
+  ws.onmessage = e => {
+    if (e.data === '\x00') return; // keepalive
+    appendLine(e.data);
+    scrollLog();
+    // Refresh run status
+    loadRuns();
+  };
+  ws.onclose = () => {
+    if (activeWs === ws) activeWs = null;
+    loadRuns();
+  };
+}
+
+function appendLine(text) {
+  const logBody = document.getElementById('log-body');
+  const span = document.createElement('span');
+  span.className = 'log-line' + classifyLine(text);
+  span.textContent = text;
+  logBody.appendChild(span);
+  logBody.appendChild(document.createTextNode('\n'));
+}
+
+function classifyLine(text) {
+  if (!text) return '';
+  const l = text.toLowerCase();
+  if (l.includes('error') || l.includes('kritická') || l.includes('chyba') || l.includes('err_')) return ' err';
+  if (l.includes('warning') || l.includes('timeout') || l.includes('ban') || l.includes('čekám')) return ' warn';
+  if (l.includes('hotovo') || l.includes('uložen') || l.includes('completed')) return ' ok';
+  return '';
+}
+
+function scrollLog() {
+  if (!document.getElementById('autoscroll-cb').checked) return;
+  const b = document.getElementById('log-body');
+  b.scrollTop = b.scrollHeight;
+}
+
+function closeLog() {
+  document.getElementById('log-pane').classList.add('hidden');
+  if (activeWs) { activeWs.close(); activeWs = null; }
+  activeRunId = null;
+  document.querySelectorAll('.run-card').forEach(c => c.classList.remove('active'));
+}
+
+// ── Modal ──
+let currentScraperId = null;
+
+function openModal(scraperId) {
+  const s = scrapers.find(x => x.id === scraperId);
+  if (!s) return;
+  currentScraperId = scraperId;
+
+  document.getElementById('modal-title').textContent = `Spustit: ${s.name}`;
+  const body = document.getElementById('modal-body');
+  body.innerHTML = '';
+
+  for (const inp of s.inputs) {
+    const grp = document.createElement('div');
+    grp.className = 'form-group';
+    if (inp.condition) grp.dataset.condition = JSON.stringify(inp.condition);
+
+    let control = '';
+    if (inp.type === 'select' && inp.options) {
+      const opts = inp.options.map(o => `<option value="${o}" ${o === inp.default ? 'selected' : ''}>${o}</option>`).join('');
+      control = `<select id="inp_${inp.id}" name="${inp.id}">${opts}</select>`;
+    } else {
+      control = `<input id="inp_${inp.id}" name="${inp.id}" type="text" value="${inp.default || ''}" placeholder="${inp.default || ''}">`;
+    }
+
+    grp.innerHTML = `
+      <label for="inp_${inp.id}">${inp.label}</label>
+      ${control}
+      ${inp.hint ? `<span class="hint">${inp.hint}</span>` : ''}
+    `;
+    body.appendChild(grp);
+  }
+
+  // Progress info
+  if (s.has_progress) {
+    const info = document.createElement('div');
+    info.style.cssText = 'background:#2d2208;border:1px solid var(--yellow);border-radius:6px;padding:10px 12px;font-size:12px;color:var(--yellow)';
+    info.textContent = '⚠ Existuje progress soubor z minulého runu. Nastav "Pokračovat od minula" na "ano" pokud chceš navázat.';
+    body.appendChild(info);
+  }
+
+  // Conditional fields setup
+  setupConditionals();
+
+  document.getElementById('modal-overlay').classList.add('open');
+}
+
+function setupConditionals() {
+  const grps = document.querySelectorAll('#modal-body .form-group[data-condition]');
+  grps.forEach(grp => {
+    const cond = JSON.parse(grp.dataset.condition);
+    const watchEl = document.getElementById(`inp_${cond.field}`);
+    if (!watchEl) return;
+    const check = () => {
+      const val = watchEl.value.trim().toLowerCase();
+      grp.classList.toggle('hidden', val !== cond.value);
+    };
+    watchEl.addEventListener('input', check);
+    watchEl.addEventListener('change', check);
+    check();
+  });
+}
+
+function closeModal() {
+  document.getElementById('modal-overlay').classList.remove('open');
+  currentScraperId = null;
+}
+
+function closeModalOutside(e) {
+  if (e.target === document.getElementById('modal-overlay')) closeModal();
+}
+
+async function submitRun() {
+  if (!currentScraperId) return;
+  const s = scrapers.find(x => x.id === currentScraperId);
+  if (!s) return;
+
+  const inputs = {};
+  for (const inp of s.inputs) {
+    const el = document.getElementById(`inp_${inp.id}`);
+    if (el) inputs[inp.id] = el.value.trim();
+  }
+
+  try {
+    document.getElementById('modal-submit').disabled = true;
+    const res = await api('POST', '/api/runs', { scraper_id: currentScraperId, inputs });
+    closeModal();
+    toast(`Scraper spuštěn (run #${res.run_id})`, 'ok');
+    await loadRuns();
+    openLog(res.run_id);
+  } catch(e) {
+    toast('Chyba spuštění: ' + e.message, 'err');
+  } finally {
+    document.getElementById('modal-submit').disabled = false;
+  }
+}
+
+// ── Actions ──
+async function stopRun(runId) {
+  if (!confirm('Opravdu zastavit tento run?')) return;
+  try {
+    await api('DELETE', `/api/runs/${runId}`);
+    toast('Run zastaven', 'ok');
+    await loadRuns();
+  } catch(e) { toast('Chyba: ' + e.message, 'err'); }
+}
+
+function downloadRun(runId) {
+  window.open(`/api/runs/${runId}/download`, '_blank');
+}
+
+function downloadLatest(scraperId) {
+  // Find most recent completed run for this scraper
+  const run = runs.find(r => r.scraper_id === scraperId && (r.status === 'completed' || r.status === 'running'));
+  if (run) {
+    window.open(`/api/runs/${run.id}/download`, '_blank');
+  } else {
+    window.open(`/api/runs/latest-${scraperId}/download`, '_blank');
+  }
+}
+
+// ── Helpers ──
+function statusLabel(s) {
+  return { running: 'Běží', completed: 'Hotovo', failed: 'Chyba', stopped: 'Zastaveno' }[s] || s;
+}
+
+function fmtTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return d.toLocaleTimeString('cs-CZ', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+       + ' ' + d.toLocaleDateString('cs-CZ', { day: '2-digit', month: '2-digit' });
+}
+
+function duration(start, end) {
+  if (!start) return '';
+  const s = new Date(start);
+  const e = end ? new Date(end) : new Date();
+  const sec = Math.round((e - s) / 1000);
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.floor(sec/60)}m ${sec%60}s`;
+  return `${Math.floor(sec/3600)}h ${Math.floor((sec%3600)/60)}m`;
+}
+
+let toastTimer = null;
+function toast(msg, type) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'show ' + (type || '');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.className = ''; }, 3500);
+}
+
+// Keyboard
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    if (document.getElementById('modal-overlay').classList.contains('open')) closeModal();
+    else closeLog();
+  }
+});
+</script>
+</body>
+</html>
