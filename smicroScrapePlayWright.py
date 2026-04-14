@@ -2,6 +2,7 @@ import asyncio
 import csv
 import json
 import re
+import sys
 import time
 import random
 from datetime import datetime, timezone
@@ -18,10 +19,13 @@ PROGRESS_FILE = SCRIPT_DIR / "smicroScrapeLastProduct.json"
 
 
 # === SPRÁVA PROGRESSU ===
-def save_progress(category, page):
+def save_progress(category, page, done_urls=None):
     try:
+        data = {"category": category, "page": page}
+        if done_urls is not None:
+            data["done_urls"] = list(done_urls)
         with open(PROGRESS_FILE, 'w', encoding='utf-8') as f:
-            json.dump({"category": category, "page": page}, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False)
     except Exception as e:
         dbg(f"Chyba při ukládání progressu: {e}")
 
@@ -333,7 +337,7 @@ async def scrape_product(context, url, semaphore):
                     d['url']
                 ])
 
-            return rows_to_return
+            return rows_to_return, url
 
         except Exception as e:
             dbg(f"Kritická chyba produktu {url}: {e}")
@@ -342,8 +346,54 @@ async def scrape_product(context, url, semaphore):
             await page.close()
 
 
+# === TEST MODE ===
+async def run_test():
+    import socket
+    print("=== SMICRO.CZ Test ===")
+    try:
+        proxy_url = "socks5://127.0.0.1:40000"
+        try:
+            host, port = proxy_url.replace("socks5://", "").split(":")
+            s = socket.create_connection((host, int(port)), timeout=3)
+            s.close()
+            proxy_cfg = {"server": proxy_url}
+        except Exception:
+            proxy_cfg = None
+            print("[test] Proxy nedostupná – připojuji přímo")
+
+        async with async_playwright() as p:
+            launch_kw = {"headless": True, "args": ["--disable-blink-features=AutomationControlled"]}
+            if proxy_cfg:
+                launch_kw["proxy"] = proxy_cfg
+            browser = await p.chromium.launch(**launch_kw)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                viewport={"width": 1400, "height": 900}
+            )
+            categories = await get_categories(context)
+            if not categories:
+                print("TEST ERROR: Nepodařilo se načíst kategorie")
+                await browser.close()
+                sys.exit(1)
+            cat_name = list(categories.keys())[0]
+            cat_url = list(categories.values())[0]
+            page = await context.new_page()
+            urls = await get_listing_product_urls(page, cat_url, 0)
+            await page.close()
+            await browser.close()
+            print(f"TEST OK: {len(categories)} kategorií načteno, '{cat_name}': {len(urls)} produktů na straně 1")
+            sys.exit(0)
+    except Exception as e:
+        print(f"TEST ERROR: {e}")
+        sys.exit(1)
+
+
 # === HLAVNÍ SMYČKA ===
 async def main():
+    if '--test' in sys.argv:
+        await run_test()
+        return
+
     print("=== SMICRO.CZ Scraper (Headful Version) ===")
     csv_name = "smicro_products.csv"
 
@@ -411,6 +461,10 @@ async def main():
                 start_page = progress['page']
             else:
                 clear_progress()
+                progress = None
+
+        resume_done_urls = set(progress.get('done_urls', [])) if progress and start_cat_name else set()
+        is_on_resume_page = start_cat_name is not None
 
         writer = CsvWriter(csv_name)
         semaphore = asyncio.Semaphore(max_concurrent)
@@ -440,17 +494,32 @@ async def main():
                     print(f"  > Strana {curr_page_num} je prázdná. Konec kategorie.")
                     break
 
-                print(f"  > Strana {curr_page_num}: Nalezeno {len(product_urls)} produktů. Zpracovávám...")
+                # Na stránce restartu přeskočíme již hotové produkty
+                if is_on_resume_page:
+                    done_urls_page = resume_done_urls
+                    is_on_resume_page = False
+                else:
+                    done_urls_page = set()
 
-                tasks = []
-                for u in product_urls:
-                    tasks.append(asyncio.create_task(scrape_product(context, u, semaphore)))
+                filtered = [u for u in product_urls if u not in done_urls_page]
+                skipped = len(product_urls) - len(filtered)
+                if skipped:
+                    print(f"  > Strana {curr_page_num}: {len(product_urls)} produktů ({skipped} přeskočeno). Zpracovávám {len(filtered)}...")
+                else:
+                    print(f"  > Strana {curr_page_num}: Nalezeno {len(product_urls)} produktů. Zpracovávám...")
 
-                for res in asyncio.as_completed(tasks):
-                    rows = await res
-                    if rows:
-                        writer.write(rows)
-                        total_products += 1
+                if filtered:
+                    tasks = []
+                    for u in filtered:
+                        tasks.append(asyncio.create_task(scrape_product(context, u, semaphore)))
+
+                    for res in asyncio.as_completed(tasks):
+                        rows, url = await res
+                        if rows:
+                            writer.write(rows)
+                            total_products += 1
+                            done_urls_page.add(url)
+                            save_progress(cat_name, curr_page_num, done_urls_page)
 
                 save_progress(cat_name, curr_page_num + 1)
                 curr_page_num += 1

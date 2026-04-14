@@ -147,8 +147,8 @@ SCRAPERS = {
         "name": "MyProjectorLamps.eu",
         "description": "Scraper pro myprojectorlamps.eu – projektorové lampy",
         "script": str(SCRAPERS_DIR / "projectorLampScrape.py"),
-        "output_file": str(SCRAPERS_DIR / "vysledky.xlsx"),
-        "progress_file": "",  # nemá progress soubor
+        "output_file": str(SCRAPERS_DIR / "vysledky.csv"),
+        "progress_file": str(SCRAPERS_DIR / "projectorLampProgress.json"),
         "inputs": [
             {
                 "id": "brand",
@@ -350,6 +350,36 @@ async def csv_preview(scraper_id: str, n: int = 100):
     rows = [parse_line(line.rstrip()) for line in last]
 
     return {"header": header, "rows": rows, "total_rows": len(data_lines)}
+
+
+@app.post("/api/scrapers/{scraper_id}/test")
+async def test_scraper(scraper_id: str):
+    """Spustí scraper s --test flaggem a vrátí výsledek do 60s."""
+    if scraper_id not in SCRAPERS:
+        raise HTTPException(404, "Scraper nenalezen")
+    scraper = SCRAPERS[scraper_id]
+    if not scraper.get("available"):
+        raise HTTPException(400, "Script scraperu nenalezen")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-u", scraper["script"], "--test",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(Path(scraper["script"]).parent),
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return {"ok": False, "output": "Timeout – test neodpověděl do 60s"}
+        output = stdout.decode("utf-8", errors="replace")
+        ok = proc.returncode == 0 and "TEST OK" in output
+        return {"ok": ok, "output": output}
+    except Exception as e:
+        return {"ok": False, "output": f"Chyba spuštění: {e}"}
 
 
 @app.post("/api/proxy-check-full")

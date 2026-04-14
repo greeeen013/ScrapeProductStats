@@ -254,6 +254,22 @@
     #toast.err { border-color: var(--red); color: var(--red); }
     #toast.ok  { border-color: var(--green); color: var(--green); }
 
+    /* ── TEST RESULT MODAL ── */
+    .test-modal { width: 520px; }
+    .test-output {
+      background: #010409; border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 12px 14px; font-family: 'Cascadia Code','Consolas',monospace;
+      font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-all;
+      max-height: 320px; overflow-y: auto; color: var(--muted);
+    }
+    .test-result-badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 14px; font-weight: 600; padding: 6px 14px;
+      border-radius: var(--radius);
+    }
+    .test-result-badge.ok  { background: #122922; color: var(--green); border: 1px solid var(--green); }
+    .test-result-badge.err { background: #3d1515; color: var(--red);   border: 1px solid var(--red); }
+
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
@@ -345,6 +361,23 @@
     </div>
     <div class="modal-footer">
       <button class="btn ghost" onclick="closeCsvModal()">Zavřít</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Test výsledek -->
+<div class="modal-overlay" id="test-modal-overlay" onclick="closeTestModalOutside(event)">
+  <div class="modal test-modal">
+    <div class="modal-header">
+      <h2 id="test-modal-title">Test scraperu</h2>
+      <button class="modal-close" onclick="closeTestModal()">×</button>
+    </div>
+    <div class="modal-body" style="gap:12px">
+      <div id="test-result-badge"></div>
+      <div class="test-output" id="test-output">Spouštím test…</div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn ghost" onclick="closeTestModal()">Zavřít</button>
     </div>
   </div>
 </div>
@@ -526,6 +559,7 @@ function renderScrapers() {
       ${badges.length ? `<div class="badges">${badges.join('')}</div>` : ''}
       <div class="actions">
         <button class="btn primary sm" ${!s.available ? 'disabled' : ''} onclick="openModal('${s.id}')">▶ Spustit</button>
+        <button class="btn ghost sm" id="test-btn-${s.id}" ${!s.available ? 'disabled' : ''} onclick="testScraper('${s.id}')">🧪 Test</button>
         ${dlBtn}
       </div>
     `;
@@ -865,9 +899,57 @@ function toast(msg, type) {
   toastTimer = setTimeout(() => el.className = '', 3500);
 }
 
+// ══════════════════════════════════════════════
+// Scraper test
+// ══════════════════════════════════════════════
+async function testScraper(scraperId) {
+  const s = scrapers.find(x => x.id === scraperId);
+  const btn = document.getElementById(`test-btn-${scraperId}`);
+  const overlay = document.getElementById('test-modal-overlay');
+  const title   = document.getElementById('test-modal-title');
+  const badge   = document.getElementById('test-result-badge');
+  const output  = document.getElementById('test-output');
+
+  title.textContent = `Test – ${s ? s.name : scraperId}`;
+  badge.innerHTML = '';
+  output.textContent = 'Spouštím test… (může trvat až 60s)';
+  overlay.classList.add('open');
+
+  if (btn) { btn.disabled = true; btn.textContent = '⏳…'; }
+
+  try {
+    const r = await fetch(`/api/scrapers/${scraperId}/test`, { method: 'POST' });
+    const data = await r.json();
+
+    output.textContent = data.output || '(prázdný výstup)';
+
+    const lines = (data.output || '').split('\n');
+    const resultLine = lines.find(l => l.includes('TEST OK') || l.includes('TEST ERROR')) || '';
+
+    if (data.ok) {
+      badge.innerHTML = `<span class="test-result-badge ok">✓ OK</span> <span style="font-size:13px;color:var(--muted)">${resultLine.replace(/^TEST OK:\s*/,'')}</span>`;
+    } else {
+      badge.innerHTML = `<span class="test-result-badge err">✗ ERROR</span> <span style="font-size:13px;color:var(--muted)">${resultLine.replace(/^TEST ERROR:\s*/,'')}</span>`;
+    }
+  } catch(e) {
+    badge.innerHTML = `<span class="test-result-badge err">✗ ERROR</span>`;
+    output.textContent = 'Chyba volání API: ' + e.message;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🧪 Test'; }
+  }
+}
+
+function closeTestModal() {
+  document.getElementById('test-modal-overlay').classList.remove('open');
+}
+function closeTestModalOutside(e) {
+  if (e.target === document.getElementById('test-modal-overlay')) closeTestModal();
+}
+
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
-    if (document.getElementById('drawer-overlay').classList.contains('open')) closeDrawer();
+    if (document.getElementById('test-modal-overlay').classList.contains('open')) closeTestModal();
+    else if (document.getElementById('drawer-overlay').classList.contains('open')) closeDrawer();
     else if (document.getElementById('modal-overlay').classList.contains('open')) closeModal();
     else closeLog();
   }

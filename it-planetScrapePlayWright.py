@@ -38,6 +38,35 @@ STEALTH_JS = """
 """
 
 
+# === SPRÁVA PROGRESSU ===
+def save_progress(section, page, done_urls=None):
+    try:
+        data = {"section": section, "page": page}
+        if done_urls is not None:
+            data["done_urls"] = list(done_urls)
+        with open(PROGRESS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        dbg(f"Chyba při ukládání progressu: {e}")
+
+
+def load_progress():
+    if PROGRESS_FILE.exists():
+        try:
+            return json.loads(PROGRESS_FILE.read_text(encoding='utf-8'))
+        except Exception:
+            return None
+    return None
+
+
+def clear_progress():
+    try:
+        if PROGRESS_FILE.exists():
+            PROGRESS_FILE.unlink()
+    except Exception:
+        pass
+
+
 # === POMOCNÉ FUNKCE ===
 def dbg(msg):
     ts = time.strftime("%H:%M:%S")
@@ -487,6 +516,50 @@ async def get_listing_urls(page: Page, section_url, page_num):
         return []
 
 
+async def run_test():
+    print("=== IT-Planet Test ===")
+    try:
+        PROXY_URL = "socks5://127.0.0.1:40000"
+        proxy_ok = await test_proxy(PROXY_URL)
+        proxy_cfg = {"server": PROXY_URL} if proxy_ok else None
+        if not proxy_ok:
+            print("[test] Proxy nedostupná – připojuji přímo")
+
+        async with async_playwright() as p:
+            launch_kw = dict(
+                headless=True,
+                args=["--disable-gpu", "--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            )
+            if proxy_cfg:
+                launch_kw["proxy"] = proxy_cfg
+            browser = await p.chromium.launch(**launch_kw)
+            context = await browser.new_context(
+                viewport={"width": 1600, "height": 1000},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            )
+            await context.add_init_script(STEALTH_JS)
+
+            sections = await get_sections(context)
+            if not sections:
+                print("TEST ERROR: Nepodařilo se načíst sekce")
+                await browser.close()
+                sys.exit(1)
+
+            sec_name = list(sections.keys())[0]
+            sec_url = list(sections.values())[0]
+
+            page = await context.new_page()
+            urls = await get_listing_urls(page, sec_url, 1)
+            await page.close()
+            await browser.close()
+
+            print(f"TEST OK: {len(sections)} sekcí načteno, '{sec_name}': {len(urls)} produktů na straně 1")
+            sys.exit(0)
+    except Exception as e:
+        print(f"TEST ERROR: {e}")
+        sys.exit(1)
+
+
 async def test_proxy(proxy_url: str) -> bool:
     """Otestuje dostupnost SOCKS5 proxy jednoduchým TCP spojením."""
     import socket
@@ -501,6 +574,10 @@ async def test_proxy(proxy_url: str) -> bool:
 
 # === MAIN ===
 async def main():
+    if '--test' in sys.argv:
+        await run_test()
+        return
+
     print("=== IT-Planet Scraper ===")
 
     out_name = "it-planet_data.csv"
@@ -575,17 +652,43 @@ async def main():
             await browser.close()
             return
 
+        # Načtení progressu
+        start_sec_name = None
+        start_page = 1
+        progress = load_progress()
+        if progress:
+            print(f"\nNalezen uložený postup: sekce '{progress['section']}', strana {progress['page']}")
+            ans = input("Pokračovat od posledního místa? (ano/ne): ").strip().lower()
+            if ans == 'ano':
+                start_sec_name = progress['section']
+                start_page = progress['page']
+            else:
+                clear_progress()
+                progress = None
+
+        resume_done_urls = set(progress.get('done_urls', [])) if progress and start_sec_name else set()
+        is_on_resume_page = start_sec_name is not None
+
         writer = CsvWriter(out_name)
         semaphore = asyncio.Semaphore(max_concurrent)
 
         total_cnt = 0
+        skip_to_sec = start_sec_name is not None
 
         for sec_name in selected:
+            if skip_to_sec:
+                if sec_name != start_sec_name:
+                    print(f"  (přeskakuji sekci: {sec_name})")
+                    continue
+                else:
+                    skip_to_sec = False
+
             sec_url = sections[sec_name]
             print(f"\n>>> Zpracovávám: {sec_name}")
 
             page_obj = await context.new_page()
-            curr_page = 1
+            curr_page = start_page if sec_name == start_sec_name else 1
+            start_page = 1
 
             while True:
                 urls = await get_listing_urls(page_obj, sec_url, curr_page)
@@ -593,23 +696,40 @@ async def main():
                     print(f"  > Konec {sec_name} (str {curr_page} bez produktů)")
                     break
 
-                print(f"  > Strana {curr_page}: {len(urls)} produktů. Zpracovávám...")
+                if is_on_resume_page:
+                    done_urls_page = resume_done_urls
+                    is_on_resume_page = False
+                else:
+                    done_urls_page = set()
 
-                tasks = []
-                for u in urls:
-                    tasks.append(asyncio.create_task(scrape_product(context, u, semaphore)))
+                filtered = [u for u in urls if u not in done_urls_page]
+                skipped = len(urls) - len(filtered)
+                if skipped:
+                    print(f"  > Strana {curr_page}: {len(urls)} produktů ({skipped} přeskočeno). Zpracovávám {len(filtered)}...")
+                else:
+                    print(f"  > Strana {curr_page}: {len(urls)} produktů. Zpracovávám...")
 
-                for res in asyncio.as_completed(tasks):
-                    rows, _ = await res
-                    if rows:
-                        writer.write(rows)
-                        total_cnt += 1
+                if filtered:
+                    tasks = []
+                    for u in filtered:
+                        tasks.append(asyncio.create_task(scrape_product(context, u, semaphore)))
 
+                    for res in asyncio.as_completed(tasks):
+                        rows, url = await res
+                        if rows:
+                            writer.write(rows)
+                            total_cnt += 1
+                            done_urls_page.add(url)
+                            save_progress(sec_name, curr_page, done_urls_page)
+
+                save_progress(sec_name, curr_page + 1)
                 curr_page += 1
 
             await page_obj.close()
+            clear_progress()
 
         print(f"\nHOTOVO. Celkem: {total_cnt}")
+        clear_progress()
         await browser.close()
 
 

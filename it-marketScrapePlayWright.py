@@ -17,9 +17,6 @@ if hasattr(sys.stdout, 'buffer') and sys.stdout.encoding.lower().replace('-', ''
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
-import openpyxl
-from openpyxl import Workbook
-
 try:
     from playwright_stealth import stealth_async
     STEALTH_AVAILABLE = True
@@ -96,17 +93,13 @@ async def check_cloudflare(page) -> bool:
 
 
 # === SPRÁVA PROGRESSU ===
-async def save_progress(section, page, product_idx, url):
-    data = {
-        "section": section,
-        "page": page,
-        "product_idx_on_page": product_idx,
-        "url": url,
-        "ts": datetime.now(timezone.utc).isoformat(),
-    }
+def save_progress(section, page, done_urls=None):
     try:
+        data = {"section": section, "page": page}
+        if done_urls is not None:
+            data["done_urls"] = list(done_urls)
         with open(PROGRESS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False)
     except Exception as e:
         dbg(f"Chyba při ukládání progressu: {e}")
 
@@ -624,45 +617,23 @@ async def get_sections(context):
 
 # === UKLÁDÁNÍ DAT ===
 class DataWriter:
-    def __init__(self, filepath, fmt):
+    def __init__(self, filepath):
         self.filepath = Path(filepath)
-        self.fmt = fmt
         self.headers = [
             'Product Name', 'Condition', 'Price', 'Net Price', 'Stock Status',
             'Quantity Available', 'Delivery Time', 'Product Number', 'Images',
             'Description & Properties', 'Category Path'
         ]
-        self._init_file()
-
-    def _init_file(self):
-        # Pokud by byl formát excel, necháme to tak, ale tento kód se primárně zaměřuje na CSV
-        if self.fmt == 'excel':
-            if not self.filepath.exists():
-                wb = Workbook()
-                ws = wb.active
-                ws.append(self.headers)
-                wb.save(self.filepath)
-        else:
-            if not self.filepath.exists():
-                with open(self.filepath, 'w', newline='', encoding='utf-8') as f:
-                    # === ZMĚNA: oddělovač ; a vynucené uvozovky pro vše ===
-                    writer = csv.writer(f, delimiter=';', quoting=csv.QUOTE_ALL)
-                    writer.writerow(self.headers)
+        if not self.filepath.exists():
+            with open(self.filepath, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f, delimiter=';', quoting=csv.QUOTE_ALL)
+                writer.writerow(self.headers)
 
     def write(self, rows):
         if not rows: return
-        if self.fmt == 'excel':
-            wb = openpyxl.load_workbook(self.filepath)
-            ws = wb.active
-            for r in rows:
-                ws.append(r)
-            wb.save(self.filepath)
-            wb.close()
-        else:
-            with open(self.filepath, 'a', newline='', encoding='utf-8') as f:
-                # === ZMĚNA: oddělovač ; a vynucené uvozovky pro vše ===
-                writer = csv.writer(f, delimiter=';', quoting=csv.QUOTE_ALL)
-                writer.writerows(rows)
+        with open(self.filepath, 'a', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f, delimiter=';', quoting=csv.QUOTE_ALL)
+            writer.writerows(rows)
 
 
 async def test_proxy(proxy_url: str) -> bool:
@@ -677,13 +648,61 @@ async def test_proxy(proxy_url: str) -> bool:
         return False
 
 
+# === TEST MODE ===
+async def run_test():
+    print("=== IT-Market Test ===")
+    try:
+        PROXY_URL = "socks5://127.0.0.1:40000"
+        proxy_ok = await test_proxy(PROXY_URL)
+        proxy_cfg = {"server": PROXY_URL} if proxy_ok else None
+        if not proxy_ok:
+            print("[test] Proxy nedostupná – připojuji přímo")
+
+        async with async_playwright() as p:
+            launch_kw = dict(
+                headless=True,
+                args=["--disable-gpu", "--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            )
+            if proxy_cfg:
+                launch_kw["proxy"] = proxy_cfg
+            browser = await p.chromium.launch(**launch_kw)
+            context = await browser.new_context(
+                viewport={"width": 1600, "height": 1200},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            )
+            await context.add_init_script(STEALTH_JS)
+
+            sections = await get_sections(context)
+            if not sections:
+                print("TEST ERROR: Nepodařilo se načíst sekce")
+                await browser.close()
+                sys.exit(1)
+
+            sec_name = list(sections.keys())[0]
+            sec_url = list(sections.values())[0]
+
+            page = await context.new_page()
+            urls = await get_listing_urls(page, sec_url, 1)
+            await page.close()
+            await browser.close()
+
+            print(f"TEST OK: {len(sections)} sekcí načteno, '{sec_name}': {len(urls)} produktů na straně 1")
+            sys.exit(0)
+    except Exception as e:
+        print(f"TEST ERROR: {e}")
+        sys.exit(1)
+
+
 # === HLAVNÍ FUNKCE ===
 async def main():
+    if '--test' in sys.argv:
+        await run_test()
+        return
+
     print("=== IT-Market Scraper (Playwright) ===")
 
-    file_format = "csv"
     out_name = "it-market.csv"
-    print(f"Výstup nastaven na: {out_name} (Formát: {file_format}, oddělovač: ';', uvozovky: vše)")
+    print(f"Výstup nastaven na: {out_name} (oddělovač: ';', uvozovky: vše)")
 
     headless = input("Headless režim? (ano/ne - enter=ano): ").strip().lower() != "ne"
 
@@ -770,7 +789,6 @@ async def main():
         progress = load_progress()
         start_sec_idx = 0
         start_page = 1
-        start_prod_idx = 1
 
         if progress:
             print(f"Nalezen progress: {progress['section']} - str {progress['page']}")
@@ -782,11 +800,14 @@ async def main():
                         except ValueError:
                             pass
                     start_page = progress['page']
-                    start_prod_idx = progress['product_idx_on_page']
             else:
                 clear_progress()
+                progress = None
 
-        writer = DataWriter(out_name, file_format)
+        resume_done_urls = set(progress.get('done_urls', [])) if progress else set()
+        is_on_resume_page = bool(progress)
+
+        writer = DataWriter(out_name)
         semaphore = asyncio.Semaphore(max_concurrent)
 
         total_processed = 0
@@ -798,10 +819,10 @@ async def main():
             print(f"\n>>> Zpracovávám sekci: {sec_name}")
 
             current_page = start_page if i == start_sec_idx else 1
-            current_prod_idx = start_prod_idx if i == start_sec_idx else 1
 
             listing_page_obj = await context.new_page()
             proxy_failed = False
+            done_urls_page = set()
 
             try:
                 while True:
@@ -821,43 +842,49 @@ async def main():
                         print("  > Žádné další produkty, konec sekce.")
                         break
 
-                    urls_to_process = urls[(current_prod_idx - 1):]
-                    if not urls_to_process and current_prod_idx > 1:
-                        break
+                    if is_on_resume_page:
+                        done_urls_page = resume_done_urls
+                        is_on_resume_page = False
+                    else:
+                        done_urls_page = set()
 
-                    print(f"    > Nalezeno {len(urls)} produktů (zpracuji {len(urls_to_process)})")
+                    filtered = [u for u in urls if u not in done_urls_page]
+                    skipped = len(urls) - len(filtered)
+                    if skipped:
+                        print(f"    > {len(urls)} produktů ({skipped} přeskočeno). Zpracovávám {len(filtered)}...")
+                    else:
+                        print(f"    > Nalezeno {len(urls)} produktů. Zpracovávám...")
 
-                    pending_tasks = []
-                    for idx_on_page_rel, p_url in enumerate(urls_to_process):
-                        coro = scrape_product(context, p_url, semaphore)
-                        task = asyncio.create_task(coro)
-                        pending_tasks.append(task)
+                    if filtered:
+                        pending_tasks = []
+                        for p_url in filtered:
+                            pending_tasks.append(asyncio.create_task(scrape_product(context, p_url, semaphore)))
 
-                    page_proxy_failed = False
-                    for completed_task in asyncio.as_completed(pending_tasks):
-                        try:
-                            rows, url_done = await completed_task
-                            if rows:
-                                writer.write(rows)
-                                total_processed += 1
-                                dbg(f"Hotovo ({total_processed}): {url_done}")
-                        except ProxyConnectionError as e:
-                            print(f"\n!!! PROXY SELHALA v produktovém tasku: {e}")
-                            page_proxy_failed = True
-                            # Zruš zbývající tasky
-                            for t in pending_tasks:
-                                t.cancel()
+                        page_proxy_failed = False
+                        for completed_task in asyncio.as_completed(pending_tasks):
+                            try:
+                                rows, url_done = await completed_task
+                                if rows:
+                                    writer.write(rows)
+                                    total_processed += 1
+                                    done_urls_page.add(url_done)
+                                    save_progress(sec_name, current_page, done_urls_page)
+                                    dbg(f"Hotovo ({total_processed}): {url_done}")
+                            except ProxyConnectionError as e:
+                                print(f"\n!!! PROXY SELHALA v produktovém tasku: {e}")
+                                page_proxy_failed = True
+                                for t in pending_tasks:
+                                    t.cancel()
+                                break
+                            except Exception as e:
+                                print(f"CHYBA v tasku: {e}")
+
+                        if page_proxy_failed:
+                            proxy_failed = True
                             break
-                        except Exception as e:
-                            print(f"CHYBA v tasku: {e}")
 
-                    if page_proxy_failed:
-                        proxy_failed = True
-                        break
-
-                    await save_progress(sec_name, current_page + 1, 1, "End of Page")
+                    save_progress(sec_name, current_page + 1)
                     current_page += 1
-                    current_prod_idx = 1
 
             finally:
                 try:
@@ -867,7 +894,7 @@ async def main():
 
             if proxy_failed:
                 print("\n>>> Proxy se odpojila – restartuji browser bez proxy a pokračuji...")
-                await save_progress(sec_name, current_page, current_prod_idx, "proxy_fail_restart")
+                save_progress(sec_name, current_page, done_urls_page)
                 try:
                     await browser.close()
                 except Exception:
@@ -878,7 +905,8 @@ async def main():
                 # Pokračuj od aktuální sekce a stránky (nezvedáme i)
                 start_sec_idx = i
                 start_page = current_page
-                start_prod_idx = current_prod_idx
+                is_on_resume_page = True
+                resume_done_urls = done_urls_page
                 continue
 
             start_page = 1
