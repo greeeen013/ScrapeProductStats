@@ -78,9 +78,19 @@
       border: 1px solid transparent; cursor: default;
     }
     .pill.progress { border-color: var(--yellow); color: var(--yellow); }
-    .pill.has-file  { border-color: var(--green);  color: var(--green); cursor: default; }
-    .pill.has-file[title] { cursor: help; }
+    .pill.has-file  { border-color: var(--green);  color: var(--green); cursor: pointer; }
+    .pill.has-file:hover { background: rgba(63,185,80,.12); }
     .pill.unavail   { border-color: var(--red);    color: var(--red);   }
+
+    /* ── CSV PREVIEW MODAL ── */
+    .csv-modal { width: 92vw; max-width: 1100px; }
+    .csv-table-wrap { overflow: auto; max-height: 60vh; border: 1px solid var(--border); border-radius: var(--radius); }
+    .csv-table { border-collapse: collapse; font-size: 12px; white-space: nowrap; width: 100%; }
+    .csv-table th { background: var(--surface2); color: var(--muted); font-weight: 600; text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); position: sticky; top: 0; }
+    .csv-table td { padding: 5px 10px; border-bottom: 1px solid #1e242b; max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+    .csv-table tr:last-child td { border-bottom: none; }
+    .csv-table tr:hover td { background: var(--surface2); }
+    .csv-meta { font-size: 12px; color: var(--muted); }
 
     /* ── BUTTONS ── */
     .btn {
@@ -317,6 +327,28 @@
   </div>
 </div>
 
+<!-- Modal: CSV preview -->
+<div class="modal-overlay" id="csv-modal-overlay" onclick="closeCsvModalOutside(event)">
+  <div class="modal csv-modal">
+    <div class="modal-header">
+      <h2 id="csv-modal-title">Náhled CSV</h2>
+      <button class="modal-close" onclick="closeCsvModal()">×</button>
+    </div>
+    <div class="modal-body" style="gap:10px">
+      <span class="csv-meta" id="csv-modal-meta"></span>
+      <div class="csv-table-wrap">
+        <table class="csv-table" id="csv-modal-table">
+          <thead id="csv-modal-thead"></thead>
+          <tbody id="csv-modal-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn ghost" onclick="closeCsvModal()">Zavřít</button>
+    </div>
+  </div>
+</div>
+
 <!-- Settings drawer -->
 <div class="drawer-overlay" id="drawer-overlay" onclick="closeDrawerOutside(event)">
   <div class="drawer">
@@ -478,9 +510,10 @@ function renderScrapers() {
     if (s.has_progress) badges.push('<span class="pill progress">⚠ progress soubor</span>');
     if (s.has_output) {
       const rows = s.output_rows != null ? s.output_rows : null;
-      const tip = rows != null ? `title="${rows.toLocaleString('cs-CZ')} datových řádků"` : '';
       const label = rows != null ? `CSV (${rows.toLocaleString('cs-CZ')} řádků)` : 'CSV existuje';
-      badges.push(`<span class="pill has-file" ${tip}>${label}</span>`);
+      const csvClick = s.output_file && s.output_file.endsWith('.csv')
+        ? `onclick="showCsvPreview('${s.id}', '${s.name}')"` : '';
+      badges.push(`<span class="pill has-file" ${csvClick}>${label}</span>`);
     }
 
     const dlBtn = s.has_output
@@ -498,6 +531,60 @@ function renderScrapers() {
     `;
     el.appendChild(card);
   }
+}
+
+// ══════════════════════════════════════════════
+// CSV preview modal
+// ══════════════════════════════════════════════
+async function showCsvPreview(scraperId, scraperName) {
+  const overlay = document.getElementById('csv-modal-overlay');
+  const title   = document.getElementById('csv-modal-title');
+  const meta    = document.getElementById('csv-modal-meta');
+  const thead   = document.getElementById('csv-modal-thead');
+  const tbody   = document.getElementById('csv-modal-tbody');
+
+  title.textContent = `CSV náhled – ${scraperName}`;
+  meta.textContent  = 'Načítám…';
+  thead.innerHTML   = '';
+  tbody.innerHTML   = '';
+  overlay.classList.add('open');
+
+  try {
+    const data = await api('GET', `/api/scrapers/${scraperId}/csv-preview?n=100`);
+    const shown = data.rows.length;
+    meta.textContent = `Zobrazeno posledních ${shown} z celkem ${data.total_rows.toLocaleString('cs-CZ')} řádků`;
+
+    if (data.header.length) {
+      const tr = document.createElement('tr');
+      data.header.forEach(h => {
+        const th = document.createElement('th');
+        th.textContent = h;
+        tr.appendChild(th);
+      });
+      thead.appendChild(tr);
+    }
+
+    data.rows.forEach(row => {
+      const tr = document.createElement('tr');
+      row.forEach(cell => {
+        const td = document.createElement('td');
+        td.textContent = cell;
+        td.title = cell;
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+  } catch(e) {
+    meta.textContent = 'Chyba: ' + e.message;
+  }
+}
+
+function closeCsvModal() {
+  document.getElementById('csv-modal-overlay').classList.remove('open');
+}
+
+function closeCsvModalOutside(e) {
+  if (e.target === document.getElementById('csv-modal-overlay')) closeCsvModal();
 }
 
 function downloadScraper(scraperId) {

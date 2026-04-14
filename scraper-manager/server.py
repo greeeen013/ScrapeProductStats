@@ -65,8 +65,8 @@ SCRAPERS = {
     },
     "it-planet": {
         "id": "it-planet",
-        "name": "IT-Planet.cz",
-        "description": "Scraper pro it-planet.cz – IT hardware",
+        "name": "IT-Planet.com",
+        "description": "Scraper pro it-planet.com – IT hardware",
         "script": str(SCRAPERS_DIR / "it-planetScrapePlayWright.py"),
         "output_file": str(SCRAPERS_DIR / "it-planet_data.csv"),
         "progress_file": str(SCRAPERS_DIR / "it-planet_progress_v6.json"),
@@ -303,6 +303,40 @@ async def proxy_status(refresh: bool = False):
     _proxy_cache["ts"] = now
     _proxy_cache["data"] = data
     return data
+
+
+@app.get("/api/scrapers/{scraper_id}/csv-preview")
+async def csv_preview(scraper_id: str, n: int = 100):
+    """Vrátí posledních n řádků CSV výstupního souboru scraperu."""
+    if scraper_id not in SCRAPERS:
+        raise HTTPException(404, "Scraper nenalezen")
+    scraper = SCRAPERS[scraper_id]
+    out_path = Path(scraper["output_file"])
+    if not out_path.exists():
+        raise HTTPException(404, "Výstupní soubor neexistuje")
+    if out_path.suffix.lower() != ".csv":
+        raise HTTPException(400, "Náhled je dostupný pouze pro CSV soubory")
+
+    import csv as csv_mod, io as io_mod
+
+    def parse_line(line: str):
+        reader = csv_mod.reader(io_mod.StringIO(line), delimiter=";")
+        for row in reader:
+            return row
+        return [line]
+
+    with open(out_path, "r", encoding="utf-8-sig", errors="replace") as f:
+        all_lines = f.readlines()
+
+    if not all_lines:
+        return {"header": [], "rows": [], "total_rows": 0}
+
+    header = parse_line(all_lines[0].rstrip())
+    data_lines = all_lines[1:]
+    last = data_lines[-n:] if len(data_lines) > n else data_lines
+    rows = [parse_line(line.rstrip()) for line in last]
+
+    return {"header": header, "rows": rows, "total_rows": len(data_lines)}
 
 
 @app.post("/api/proxy-check-full")
