@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import json
 import re
 import time
 import random
@@ -12,6 +13,34 @@ from playwright.async_api import async_playwright, Page, TimeoutError as Playwri
 # === KONFIGURACE ===
 BASE_URL = "https://smicro.cz"
 START_URL = "https://smicro.cz"
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROGRESS_FILE = SCRIPT_DIR / "smicroScrapeLastProduct.json"
+
+
+# === SPRÁVA PROGRESSU ===
+def save_progress(category, page):
+    try:
+        with open(PROGRESS_FILE, 'w', encoding='utf-8') as f:
+            json.dump({"category": category, "page": page}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        dbg(f"Chyba při ukládání progressu: {e}")
+
+
+def load_progress():
+    if PROGRESS_FILE.exists():
+        try:
+            return json.loads(PROGRESS_FILE.read_text(encoding='utf-8'))
+        except Exception:
+            return None
+    return None
+
+
+def clear_progress():
+    try:
+        if PROGRESS_FILE.exists():
+            PROGRESS_FILE.unlink()
+    except Exception:
+        pass
 
 
 # === POMOCNÉ FUNKCE ===
@@ -370,16 +399,39 @@ async def main():
             await browser.close()
             return
 
+        # Načtení progressu
+        start_cat_name = None
+        start_page = 1
+        progress = load_progress()
+        if progress:
+            print(f"\nNalezen uložený postup: kategorie '{progress['category']}', strana {progress['page']}")
+            ans = input("Pokračovat od posledního místa? (ano/ne): ").strip().lower()
+            if ans == 'ano':
+                start_cat_name = progress['category']
+                start_page = progress['page']
+            else:
+                clear_progress()
+
         writer = CsvWriter(csv_name)
         semaphore = asyncio.Semaphore(max_concurrent)
 
         total_products = 0
+        skip_to_cat = start_cat_name is not None
 
         for cat_name, cat_url in urls_to_scrape:
+            # Přeskočit kategorie před resumem
+            if skip_to_cat:
+                if cat_name != start_cat_name:
+                    print(f"  (přeskakuji kategorii: {cat_name})")
+                    continue
+                else:
+                    skip_to_cat = False
+
             print(f"\n>>> Zpracovávám kategorii: {cat_name}")
 
             list_page = await context.new_page()
-            curr_page_num = 1
+            curr_page_num = start_page if cat_name == start_cat_name else 1
+            start_page = 1  # jen pro první kategorii po restartu
 
             while True:
                 product_urls = await get_listing_product_urls(list_page, cat_url, curr_page_num)
@@ -400,12 +452,14 @@ async def main():
                         writer.write(rows)
                         total_products += 1
 
+                save_progress(cat_name, curr_page_num + 1)
                 curr_page_num += 1
 
             await list_page.close()
 
         print(f"\n=== HOTOVO ===")
         print(f"Celkem uloženo produktů: {total_products}")
+        clear_progress()
         await browser.close()
 
 
