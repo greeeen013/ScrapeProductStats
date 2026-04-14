@@ -305,6 +305,19 @@ async def proxy_status(refresh: bool = False):
     return data
 
 
+@app.get("/api/scrapers/{scraper_id}/download")
+async def download_scraper_output(scraper_id: str):
+    """Stáhne výstupní soubor scraperu přímo (bez nutnosti mít aktivní run)."""
+    if scraper_id not in SCRAPERS:
+        raise HTTPException(404, "Scraper nenalezen")
+    out_path = Path(SCRAPERS[scraper_id]["output_file"])
+    if not out_path.exists():
+        raise HTTPException(404, "Výstupní soubor neexistuje – scraper ještě nedoběhl nebo nic nestáhl")
+    suffix = out_path.suffix.lower()
+    media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if suffix == ".xlsx" else "text/csv"
+    return FileResponse(str(out_path), filename=out_path.name, media_type=media)
+
+
 @app.get("/api/scrapers/{scraper_id}/csv-preview")
 async def csv_preview(scraper_id: str, n: int = 100):
     """Vrátí posledních n řádků CSV výstupního souboru scraperu."""

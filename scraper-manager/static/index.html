@@ -588,12 +588,7 @@ function closeCsvModalOutside(e) {
 }
 
 function downloadScraper(scraperId) {
-  const run = runs.find(r => r.scraper_id === scraperId);
-  if (run) {
-    window.open(`/api/runs/${run.id}/download`, '_blank');
-  } else {
-    toast('Nejprve spusť scraper – zatím žádný run.', 'err');
-  }
+  window.open(`/api/scrapers/${scraperId}/download`, '_blank');
 }
 
 // ══════════════════════════════════════════════
