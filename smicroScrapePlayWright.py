@@ -438,20 +438,34 @@ async def main():
         print("[proxy] Proxy nedostupná – připojuji přímo (bez proxy).")
 
     async with async_playwright() as p:
-        launch_kw = {
-            "headless": True,
-            "args": ["--disable-blink-features=AutomationControlled"],
-        }
-        if proxy_cfg:
-            launch_kw["proxy"] = proxy_cfg
-        browser = await p.chromium.launch(**launch_kw)
+        def make_context_args(use_proxy):
+            kw = {
+                "headless": True,
+                "args": ["--disable-blink-features=AutomationControlled"],
+            }
+            if use_proxy and proxy_cfg:
+                kw["proxy"] = proxy_cfg
+            return kw
+
+        browser = await p.chromium.launch(**make_context_args(True))
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
             viewport={"width": 1400, "height": 900}
         )
 
-        # Načtení kategorií
+        # Načtení kategorií – při selhání přes proxy zkusíme přímo
         categories = await get_categories(context)
+
+        if not categories and proxy_cfg:
+            print("[proxy] Kategorie nenačteny přes proxy – zkouším přímé připojení...")
+            await browser.close()
+            proxy_cfg = None
+            browser = await p.chromium.launch(**make_context_args(False))
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                viewport={"width": 1400, "height": 900}
+            )
+            categories = await get_categories(context)
 
         if not categories:
             print("Nepodařilo se načíst žádné kategorie. Zkontrolujte připojení.")
