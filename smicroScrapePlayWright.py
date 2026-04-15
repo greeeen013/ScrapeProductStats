@@ -394,6 +394,7 @@ async def main():
         await run_test()
         return
 
+    import socket
     print("=== SMICRO.CZ Scraper (Headful Version) ===")
     csv_name = "smicro_products.csv"
 
@@ -401,14 +402,24 @@ async def main():
     w_input = input("Počet workerů (okno) [2]: ").strip()
     max_concurrent = int(w_input) if w_input.isdigit() else 2
 
+    proxy_url = "socks5://127.0.0.1:40000"
+    try:
+        s = socket.create_connection(("127.0.0.1", 40000), timeout=3)
+        s.close()
+        proxy_cfg = {"server": proxy_url}
+        print("[proxy] WARP proxy dostupná – připojuji přes proxy.")
+    except Exception:
+        proxy_cfg = None
+        print("[proxy] Proxy nedostupná – připojuji přímo (bez proxy).")
+
     async with async_playwright() as p:
-        # ZMĚNA: headless=False -> otevře se fyzické okno prohlížeče
-        # args: maskování automatizace
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
-            proxy={"server": "socks5://127.0.0.1:40000"}
-        )
+        launch_kw = {
+            "headless": True,
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
+        if proxy_cfg:
+            launch_kw["proxy"] = proxy_cfg
+        browser = await p.chromium.launch(**launch_kw)
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
             viewport={"width": 1400, "height": 900}
