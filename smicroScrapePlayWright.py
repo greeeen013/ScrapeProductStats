@@ -370,6 +370,7 @@ async def run_test():
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
                 viewport={"width": 1400, "height": 900}
             )
+            # 1) Kategorie
             categories = await get_categories(context)
             if not categories:
                 print("TEST ERROR: Nepodařilo se načíst kategorie")
@@ -377,11 +378,35 @@ async def run_test():
                 sys.exit(1)
             cat_name = list(categories.keys())[0]
             cat_url = list(categories.values())[0]
+            print(f"[1/3] Kategorie OK – načteno {len(categories)}, první: '{cat_name}'")
+
+            # 2) Listing produktů
             page = await context.new_page()
-            urls = await get_listing_product_urls(page, cat_url, 0)
+            urls = await get_listing_product_urls(page, cat_url, 1)
             await page.close()
+            if not urls:
+                print("TEST ERROR: Žádné produkty na straně 1")
+                await browser.close()
+                sys.exit(1)
+            print(f"[2/3] Listing OK – {len(urls)} URL na straně 1")
+
+            # 3) Extrakce dat z prvního produktu
+            prod_page = await context.new_page()
+            prod_url = urls[0]
+            await prod_page.goto(prod_url, timeout=60000, wait_until="domcontentloaded")
+            data = await extract_product_data(prod_page, prod_url)
+            await prod_page.close()
             await browser.close()
-            print(f"TEST OK: {len(categories)} kategorií načteno, '{cat_name}': {len(urls)} produktů na straně 1")
+
+            print(f"[3/3] Produkt OK:")
+            print(f"      Název:        {data['name']}")
+            print(f"      Part number:  {data['part_number']}")
+            print(f"      Výrobce:      {data['manufacturer']}")
+            print(f"      Dostupnost:   {data['avail_local']} / {data['avail_supplier']}")
+            print(f"      Cena bez DPH: {data['price_no_vat']}")
+            print(f"      Cena s DPH:   {data['price_vat']}")
+            print(f"      URL:          {data['url']}")
+            print("=== TEST OK ===")
             sys.exit(0)
     except Exception as e:
         print(f"TEST ERROR: {e}")
