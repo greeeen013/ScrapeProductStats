@@ -174,14 +174,78 @@ PROXY_CACHE_TTL = 60  # sekund
 _proxy_cache: dict = {"ts": 0.0, "data": None}
 
 # ============================================================
-# In-memory storage
+# Persistent history storage
 # ============================================================
+HISTORY_FILE = Path(__file__).parent / "runs_history.json"
+
 runs: Dict[str, dict] = {}
+
+
+def _load_history():
+    """Načte historii běhů z disku při startu serveru."""
+    if not HISTORY_FILE.exists():
+        return
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for entry in data:
+            run_id = entry["id"]
+            # Běhy, které byly "running" při posledním vypnutí, označit jako přerušené
+            if entry.get("status") == "running":
+                entry["status"] = "interrupted"
+                if not entry.get("finished_at"):
+                    entry["finished_at"] = datetime.now().isoformat()
+            run = {
+                "id": entry["id"],
+                "scraper_id": entry["scraper_id"],
+                "scraper_name": entry["scraper_name"],
+                "status": entry["status"],
+                "started_at": entry["started_at"],
+                "finished_at": entry.get("finished_at"),
+                "exit_code": entry.get("exit_code"),
+                "inputs": entry.get("inputs", {}),
+                "_logs": deque(entry.get("logs", []), maxlen=500),
+                "_subscribers": set(),
+                "_process": None,
+            }
+            runs[run_id] = run
+        print(f"[HISTORY] Načteno {len(data)} běhů z historie.")
+    except Exception as e:
+        print(f"[HISTORY] Nepodařilo se načíst historii: {e}")
+
+
+def _save_history():
+    """Uloží aktuální historii běhů na disk."""
+    try:
+        data = []
+        for run in runs.values():
+            entry = {
+                "id": run["id"],
+                "scraper_id": run["scraper_id"],
+                "scraper_name": run["scraper_name"],
+                "status": run["status"],
+                "started_at": run["started_at"],
+                "finished_at": run["finished_at"],
+                "exit_code": run["exit_code"],
+                "inputs": run["inputs"],
+                "logs": list(run["_logs"]),
+            }
+            data.append(entry)
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[HISTORY] Nepodařilo se uložit historii: {e}")
+
 
 # ============================================================
 # FastAPI app
 # ============================================================
 app = FastAPI(title="Scraper Manager")
+
+
+@app.on_event("startup")
+async def on_startup():
+    _load_history()
 
 STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -274,6 +338,7 @@ async def stop_run(run_id: str):
         proc.terminate()
         run["status"] = "stopped"
         run["finished_at"] = datetime.now().isoformat()
+        _save_history()
     return {"status": "ok"}
 
 
@@ -589,6 +654,7 @@ async def _run_scraper(run_id: str, script: str, stdin_lines: List[str]):
     finally:
         run["finished_at"] = datetime.now().isoformat()
         run["_process"] = None
+        _save_history()
 
 
 # ============================================================
