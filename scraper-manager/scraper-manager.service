@@ -1,0 +1,19 @@
+[Unit]
+Description=Scraper Manager FastAPI server
+After=network.target
+
+[Service]
+Type=simple
+# -- Uprav tyto tři řádky podle skutečných cest na serveru --
+User=TVUJ_USER
+WorkingDirectory=/cesta/k/ScrapeProductStats/scraper-manager
+ExecStart=/usr/bin/python3 /cesta/k/ScrapeProductStats/scraper-manager/server.py
+# --
+
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
